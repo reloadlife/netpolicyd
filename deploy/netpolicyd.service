@@ -1,0 +1,22 @@
+[Unit]
+Description=netpolicyd — host network policy daemon
+Documentation=file:///usr/share/doc/netpolicyd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/netpolicyd/netpolicyd.env
+ExecStart=/usr/local/bin/netpolicyd \
+  --listen ${NETPOLICYD_LISTEN:-127.0.0.1:51910} \
+  --token ${NETPOLICYD_TOKEN:-dev-token}
+Restart=on-failure
+RestartSec=2
+# Needs CAP_NET_ADMIN for live apply (ip/nft/tc/sysctl)
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
