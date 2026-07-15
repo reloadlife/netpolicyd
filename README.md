@@ -63,7 +63,9 @@ sysctl -w net.ipv4.ip_forward=1
 | **Easy** (default) | `netpolicyctl` · `NETPOLICYCTL_MODE=easy` |
 | **Advanced** | `netpolicyctl --advanced` · toggle with **`m`** in TUI |
 
-**Easy tabs:** Home · Fastpath · Masq · Block/Allow · Lists · Config · Speed · Live  
+**Easy tabs:** Home · Fastpath · Masq · Block/Allow · Lists · Config · Speed · **Traffic** · Live  
+
+**Traffic tab:** live RX/TX per interface (from `/proc/net/dev`), sockets by IP / port, and connection list (`ss`). `[` `]` cycle sections; auto-refreshes ~1s while open.
 
 **Advanced tabs:** Status · Policies · Routes · NAT · Forwards · Firewall · IP · TC · Dataplane  
 
@@ -76,7 +78,7 @@ Auth: `Authorization: Bearer <token>` on `/v1/*`.
 | Area | Paths |
 |------|--------|
 | Health | `GET /healthz` |
-| Status | `GET /v1/status` · `GET /v1/overview` · `GET /v1/dataplane` |
+| Status | `GET /v1/status` · `GET /v1/overview` · `GET /v1/dataplane` · `GET /v1/traffic` |
 | Desired | `PUT /v1/desired` · `POST /v1/apply?dry_run=1` |
 | Policies | `/v1/policies` |
 | Routes / NAT / Forwards | `/v1/routes` · `/v1/nat` · `/v1/forwards` |

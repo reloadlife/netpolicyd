@@ -58,6 +58,8 @@ func main() {
 		cliJSON(func(ctx context.Context, c *pkgapi.Client) (any, error) {
 			return c.Dataplane(ctx)
 		})
+	case "traffic":
+		cliTraffic()
 	case "apply":
 		dry := len(os.Args) > 2 && (os.Args[2] == "--dry-run" || os.Args[2] == "-n")
 		cliJSON(func(ctx context.Context, c *pkgapi.Client) (any, error) {
@@ -90,6 +92,7 @@ Usage:
   netpolicyctl lists
   netpolicyctl overview
   netpolicyctl dataplane
+  netpolicyctl traffic
   netpolicyctl apply [--dry-run]
   netpolicyctl version
 
@@ -393,6 +396,87 @@ func cliLists() {
 		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", l.ID, l.Name, len(l.Entries), strings.Join(l.Entries, ","))
 	}
 	_ = w.Flush()
+}
+
+func cliTraffic() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	t, err := mustClient().Traffic(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if wantsJSON() || (len(os.Args) > 2 && (os.Args[2] == "--json" || os.Args[2] == "-j")) {
+		printJSON(t)
+		return
+	}
+	// human table: interfaces + top IPs/ports/conns
+	fmt.Printf("collected %s  interval=%.2fs  conns=%d estab=%d listen=%d\n",
+		t.CollectedAt, t.IntervalSec, t.TotalConns, t.Established, t.Listen)
+	fmt.Printf("total  RX %s  TX %s\n\n", fmtBitRate(t.TotalRxBps), fmtBitRate(t.TotalTxBps))
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "IFACE\tRX_BPS\tTX_BPS\tRX_BYTES\tTX_BYTES")
+	for _, it := range t.Interfaces {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\n",
+			it.Name, fmtBitRate(it.RxBps), fmtBitRate(it.TxBps), it.RxBytes, it.TxBytes)
+	}
+	_ = w.Flush()
+	if len(t.ByIP) > 0 {
+		fmt.Println("\nBY IP (top)")
+		w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "SIDE\tIP\tCONNS\tSENT\tRECV")
+		limit := 20
+		for i, row := range t.ByIP {
+			if i >= limit {
+				break
+			}
+			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\n", row.Side, row.IP, row.Conns, row.BytesSent, row.BytesRecv)
+		}
+		_ = w.Flush()
+	}
+	if len(t.ByPort) > 0 {
+		fmt.Println("\nBY PORT (top)")
+		w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "SIDE\tPROTO\tPORT\tCONNS")
+		limit := 20
+		for i, row := range t.ByPort {
+			if i >= limit {
+				break
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\n", row.Side, row.Proto, row.Port, row.Conns)
+		}
+		_ = w.Flush()
+	}
+	if len(t.Connections) > 0 {
+		fmt.Println("\nCONNECTIONS (top)")
+		w = tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "PROTO\tSTATE\tLOCAL\tREMOTE\tSENT\tRECV")
+		limit := 30
+		for i, c := range t.Connections {
+			if i >= limit {
+				break
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s:%s\t%s:%s\t%d\t%d\n",
+				c.Proto, c.State, c.LocalIP, c.LocalPort, c.RemoteIP, c.RemotePort, c.BytesSent, c.BytesRecv)
+		}
+		_ = w.Flush()
+	}
+}
+
+func fmtBitRate(bps float64) string {
+	if bps <= 0 {
+		return "—"
+	}
+	switch {
+	case bps >= 1e9:
+		return fmt.Sprintf("%.1fGbit/s", bps/1e9)
+	case bps >= 1e6:
+		return fmt.Sprintf("%.1fMbit/s", bps/1e6)
+	case bps >= 1e3:
+		return fmt.Sprintf("%.1fKbit/s", bps/1e3)
+	default:
+		return fmt.Sprintf("%.0fbit/s", bps)
+	}
 }
 
 func cliJSON(fn func(context.Context, *pkgapi.Client) (any, error)) {

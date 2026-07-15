@@ -55,6 +55,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/sysctl/", s.auth(s.sysctlOne))
 	// Live host firewall / routing dump for admin UI / TUI
 	mux.HandleFunc("/v1/dataplane", s.auth(s.dataplane))
+	mux.HandleFunc("/v1/traffic", s.auth(s.traffic))
 	mux.HandleFunc("/v1/overview", s.auth(s.overview))
 	mux.HandleFunc("/metrics", s.metrics)
 	return mux
@@ -141,6 +142,14 @@ func (s *Server) dataplane(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, host.Collect())
+}
+
+func (s *Server) traffic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, host.CollectTraffic())
 }
 
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {

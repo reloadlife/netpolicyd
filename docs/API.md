@@ -24,6 +24,7 @@ Open (no auth):
 | GET | `/v1/status` | Backend, tool detect, object counts, last apply |
 | GET | `/v1/overview` | Status + all objects (+ host dump unless `?skip_host=1`) |
 | GET | `/v1/dataplane` | Live host dump (`ip`, `nft`, `iptables`, `tc`) |
+| GET | `/v1/traffic` | Live throughput + sockets (iface rates, by IP/port, connections) |
 | POST | `/v1/apply` | Reconcile desired → host. `?dry_run=1` plans only |
 | PUT/POST | `/v1/desired` | Replace bulk state from control plane, then apply |
 
@@ -235,6 +236,44 @@ Rates are **bits/sec** (`50000000` = 50 Mbit/s).
 
 ```json
 { "key": "net.ipv4.conf.all.rp_filter", "value": "2", "managed": true }
+```
+
+## Live traffic
+
+| Method | Path |
+|--------|------|
+| GET | `/v1/traffic` |
+
+Interface RX/TX rates from `/proc/net/dev` (bits/s via process-local sample delta). Socket inventory from `ss` (per IP, per port, top connections). First sample after daemon start has `interval_sec: 0` and zero rates; subsequent samples report deltas.
+
+```json
+{
+  "collected_at": "2026-07-15T12:00:00Z",
+  "interval_sec": 1.02,
+  "ss_available": true,
+  "total_rx_bps": 1250000,
+  "total_tx_bps": 480000,
+  "total_conns": 42,
+  "established": 10,
+  "listen": 8,
+  "interfaces": [
+    { "name": "eth0", "rx_bytes": 1, "tx_bytes": 2, "rx_bps": 1e6, "tx_bps": 4e5, "rx_pps": 100, "tx_pps": 50 }
+  ],
+  "by_ip": [
+    { "ip": "10.0.0.1", "side": "local", "conns": 3, "bytes_sent": 1000, "bytes_recv": 2000 }
+  ],
+  "by_port": [
+    { "port": "22", "proto": "tcp", "side": "local", "conns": 2 }
+  ],
+  "connections": [
+    {
+      "proto": "tcp", "state": "ESTAB",
+      "local_ip": "10.0.0.1", "local_port": "22",
+      "remote_ip": "1.2.3.4", "remote_port": "50000",
+      "bytes_sent": 100, "bytes_recv": 200, "send_bps": 8000
+    }
+  ]
+}
 ```
 
 ## Apply result

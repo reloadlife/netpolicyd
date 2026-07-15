@@ -166,6 +166,15 @@ func (c *Client) Dataplane(ctx context.Context) (*Dataplane, error) {
 	return &d, nil
 }
 
+// Traffic returns live interface rates + socket inventory.
+func (c *Client) Traffic(ctx context.Context) (*TrafficSnapshot, error) {
+	var t TrafficSnapshot
+	if err := c.do(ctx, http.MethodGet, "/v1/traffic", nil, &t); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
 // ListPolicies lists policy rules.
 func (c *Client) ListPolicies(ctx context.Context) ([]PolicyRule, error) {
 	var out []PolicyRule

@@ -21,8 +21,9 @@ const (
 	easyLists    = 4 // named IP/CIDR lists
 	easyConfig   = 5 // IP forward, routing, routes
 	easySpeed    = 6
-	easyLive     = 7
-	easyCount    = 8
+	easyTraffic  = 7 // live throughput: iface / ip / port / connections
+	easyLive     = 8 // host dataplane dump
+	easyCount    = 9
 
 	// legacy aliases
 	easyTunnel = easyFastpath
@@ -86,6 +87,8 @@ func (m rootModel) easyRowCount() int {
 		return len(m.routes) // show simple routes
 	case easySpeed:
 		return len(m.tc)
+	case easyTraffic:
+		return m.trafficRowCount()
 	case easyLive:
 		return m.planeLineCount()
 	default:
@@ -150,6 +153,12 @@ func (m rootModel) handleEasyListKey(key string) (tea.Model, tea.Cmd) {
 	case "7":
 		m.tab, m.cursor, m.scroll = easySpeed, 0, 0
 	case "8":
+		m.tab, m.cursor, m.scroll = easyTraffic, 0, 0
+		m.trafSec = trafSecIface
+		var fetch tea.Cmd
+		m, fetch = m.beginFetch()
+		return m, fetch
+	case "9":
 		m.tab, m.cursor, m.scroll = easyLive, 0, 0
 		var fetch tea.Cmd
 		m, fetch = m.beginFetch()
@@ -157,9 +166,29 @@ func (m rootModel) handleEasyListKey(key string) (tea.Model, tea.Cmd) {
 	case "tab", "right":
 		m.tab = (m.tab + 1) % easyCount
 		m.cursor, m.scroll = 0, 0
+		if m.tab == easyTraffic || m.tab == easyLive {
+			var fetch tea.Cmd
+			m, fetch = m.beginFetch()
+			return m, fetch
+		}
 	case "shift+tab", "left", "h":
 		m.tab = (m.tab + easyCount - 1) % easyCount
 		m.cursor, m.scroll = 0, 0
+		if m.tab == easyTraffic || m.tab == easyLive {
+			var fetch tea.Cmd
+			m, fetch = m.beginFetch()
+			return m, fetch
+		}
+	case "[":
+		if m.tab == easyTraffic {
+			m.trafSec = (m.trafSec + 3) % 4
+			m.cursor, m.scroll = 0, 0
+		}
+	case "]":
+		if m.tab == easyTraffic {
+			m.trafSec = (m.trafSec + 1) % 4
+			m.cursor, m.scroll = 0, 0
+		}
 	case "j", "down":
 		if m.tab == easyLive || m.tab == easyHome {
 			m.scroll++
@@ -1213,9 +1242,9 @@ func (m rootModel) submitEasySpeed() (tea.Model, tea.Cmd) {
 func (m rootModel) renderEasyTabs() string {
 	// Short labels keep one row on typical 80–120 col terminals.
 	// Full names when wide enough.
-	names := []string{"Home", "Path", "Masq", "Access", "Lists", "Cfg", "Speed", "Live"}
-	if m.width >= 100 {
-		names = []string{"Home", "Fastpath", "Masq", "Block/Allow", "Lists", "Config", "Speed", "Live"}
+	names := []string{"Home", "Path", "Masq", "Access", "Lists", "Cfg", "Speed", "Traf", "Live"}
+	if m.width >= 110 {
+		names = []string{"Home", "Fastpath", "Masq", "Block/Allow", "Lists", "Config", "Speed", "Traffic", "Live"}
 	}
 	parts := make([]string, len(names))
 	for i, n := range names {
@@ -1231,22 +1260,24 @@ func (m rootModel) renderEasyTabs() string {
 }
 
 func (m rootModel) easyListHelp() string {
-	base := "1-8 · j/k · n new · D delete · a apply · m advanced · q quit"
+	base := "1-9 · j/k · n new · D delete · a apply · m advanced · q quit"
 	switch m.tab {
 	case easyHome:
-		return "1-8 · f forward · g gateway · o allow · b block · a apply · m advanced"
+		return "1-9 · f forward · g gateway · o allow · b block · a apply · m advanced"
 	case easyFastpath:
 		return base + " · n = client→tunnel fastpath"
 	case easyMasq:
 		return base + " · n = easy masquerade (list or CIDR)"
 	case easyAccess:
-		return "1-8 · n rule · o SSH · b block · lists OK · a apply · m advanced"
+		return "1-9 · n rule · o SSH · b block · lists OK · a apply · m advanced"
 	case easyLists:
-		return "1-8 · n new list · i add IPs · D delete list · a apply · m advanced"
+		return "1-9 · n new list · i add IPs · D delete list · a apply · m advanced"
 	case easyConfig:
-		return "1-8 · n sysctls · f forward · g routing · u route · p rpf · a apply"
+		return "1-9 · n sysctls · f forward · g routing · u route · p rpf · a apply"
+	case easyTraffic:
+		return "8 Traffic · [/] iface|ip|port|conn · j/k · r refresh (1s) · m advanced · q quit"
 	case easyLive:
-		return "1-8 · j/k scroll · r refresh · m advanced · q quit"
+		return "9 Live · j/k scroll · r refresh · m advanced · q quit"
 	default:
 		return base
 	}
@@ -1297,8 +1328,13 @@ func (m rootModel) viewEasyHome() string {
 			"  4 Block/Allow  ports, IPs, lists\n" +
 			"  5 Lists      create IP groups, then use in rules\n" +
 			"  6 Config     f=forward  g=routing  u=route  p=rpf\n" +
+			"  8 Traffic    live RX/TX per iface · IP · port · conn\n" +
 			"  a Apply now  ·  m Advanced\n",
 	))
+	if m.traffic != nil {
+		b.WriteString("\n")
+		b.WriteString(panelStyle.Render(m.viewTrafficSummary()))
+	}
 
 	if m.lastApply != nil && len(m.lastApply.Commands) > 0 {
 		b.WriteString("\n")
@@ -1550,7 +1586,7 @@ func (m rootModel) viewEasyLive() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Live host view"))
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("Read-only snapshot of what the kernel is doing right now."))
+	b.WriteString(dimStyle.Render("Read-only kernel dump (nft/iptables/routes). For rates use 8 Traffic."))
 	b.WriteString("\n\n")
 	b.WriteString(m.viewDataplane())
 	return b.String()
@@ -1572,6 +1608,8 @@ func (m rootModel) viewEasyMain() string {
 		return m.viewEasyConfig()
 	case easySpeed:
 		return m.viewEasySpeed()
+	case easyTraffic:
+		return m.viewTraffic()
 	case easyLive:
 		return m.viewEasyLive()
 	default:

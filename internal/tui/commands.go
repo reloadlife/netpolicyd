@@ -31,6 +31,7 @@ type dataMsg struct {
 	sysctls   []pkgapi.SysctlSpec
 	ipLists   []pkgapi.IPList
 	dataplane *pkgapi.Dataplane
+	traffic   *pkgapi.TrafficSnapshot
 	err       error
 }
 
@@ -56,7 +57,7 @@ func flashClearCmd(id int) tea.Cmd {
 	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return flashClearMsg{id: id} })
 }
 
-func fetchData(c *pkgapi.Client, gen uint64, withHost bool) tea.Cmd {
+func fetchData(c *pkgapi.Client, gen uint64, withHost, withTraffic bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
@@ -109,6 +110,11 @@ func fetchData(c *pkgapi.Client, gen uint64, withHost bool) tea.Cmd {
 					msg.dataplane = dp
 				}
 			}
+			if withTraffic {
+				if tr, e := c.Traffic(ctx); e == nil {
+					msg.traffic = tr
+				}
+			}
 			return msg
 		}
 		msg.status = ov.Status
@@ -124,6 +130,11 @@ func fetchData(c *pkgapi.Client, gen uint64, withHost bool) tea.Cmd {
 		msg.sysctls = ov.Sysctls
 		msg.ipLists = ov.IPLists
 		msg.dataplane = ov.Dataplane
+		if withTraffic {
+			if tr, e := c.Traffic(ctx); e == nil {
+				msg.traffic = tr
+			}
+		}
 		return msg
 	}
 }

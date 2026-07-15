@@ -403,6 +403,75 @@ type Dataplane struct {
 	TCErr      string            `json:"tc_error,omitempty"`
 }
 
+// TrafficSnapshot is live throughput + connection inventory for the TUI.
+type TrafficSnapshot struct {
+	CollectedAt string  `json:"collected_at"`
+	IntervalSec float64 `json:"interval_sec"` // seconds since previous sample (0 = first)
+	SSAvailable bool    `json:"ss_available"`
+	Error       string  `json:"error,omitempty"`
+
+	// Interfaces from /proc/net/dev (+ rates from sample delta).
+	Interfaces []IfaceTraffic `json:"interfaces,omitempty"`
+	// Aggregates from active sockets (ss).
+	ByIP   []IPTraffic   `json:"by_ip,omitempty"`
+	ByPort []PortTraffic `json:"by_port,omitempty"`
+	// Top connections (ESTAB preferred), with byte counters when ss -i available.
+	Connections []ConnTraffic `json:"connections,omitempty"`
+
+	// Totals
+	TotalConns   int   `json:"total_conns"`
+	Established  int   `json:"established"`
+	Listen       int   `json:"listen"`
+	TotalRxBps   float64 `json:"total_rx_bps"`
+	TotalTxBps   float64 `json:"total_tx_bps"`
+}
+
+// IfaceTraffic is per-netdev counters and rates.
+type IfaceTraffic struct {
+	Name      string  `json:"name"`
+	RxBytes   int64   `json:"rx_bytes"`
+	TxBytes   int64   `json:"tx_bytes"`
+	RxPackets int64   `json:"rx_packets"`
+	TxPackets int64   `json:"tx_packets"`
+	RxBps     float64 `json:"rx_bps"`
+	TxBps     float64 `json:"tx_bps"`
+	RxPps     float64 `json:"rx_pps"`
+	TxPps     float64 `json:"tx_pps"`
+}
+
+// IPTraffic aggregates sockets by local or remote IP.
+type IPTraffic struct {
+	IP        string  `json:"ip"`
+	Side      string  `json:"side"` // local | remote
+	Conns     int     `json:"conns"`
+	BytesSent int64   `json:"bytes_sent,omitempty"`
+	BytesRecv int64   `json:"bytes_recv,omitempty"`
+	SendBps   float64 `json:"send_bps,omitempty"` // from ss "send" when present
+}
+
+// PortTraffic aggregates by local or remote port + protocol.
+type PortTraffic struct {
+	Port      string `json:"port"`
+	Proto     string `json:"proto"` // tcp | udp
+	Side      string `json:"side"`  // local | remote
+	Conns     int    `json:"conns"`
+	BytesSent int64  `json:"bytes_sent,omitempty"`
+	BytesRecv int64  `json:"bytes_recv,omitempty"`
+}
+
+// ConnTraffic is one socket row.
+type ConnTraffic struct {
+	Proto      string  `json:"proto"`
+	State      string  `json:"state"`
+	LocalIP    string  `json:"local_ip"`
+	LocalPort  string  `json:"local_port"`
+	RemoteIP   string  `json:"remote_ip"`
+	RemotePort string  `json:"remote_port"`
+	BytesSent  int64   `json:"bytes_sent,omitempty"`
+	BytesRecv  int64   `json:"bytes_recv,omitempty"`
+	SendBps    float64 `json:"send_bps,omitempty"`
+}
+
 // VersionInfo is /v1/version.
 type VersionInfo struct {
 	Version string `json:"version"`

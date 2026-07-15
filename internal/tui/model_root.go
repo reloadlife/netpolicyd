@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -21,8 +22,15 @@ const (
 	tabFirewall = 5
 	tabIP       = 6
 	tabTC       = 7
-	tabPlane    = 8
-	tabCount    = 9
+	tabTraffic  = 8
+	tabPlane    = 9
+	tabCount    = 10
+
+	// traffic sub-views
+	trafSecIface = 0
+	trafSecIP    = 1
+	trafSecPort  = 2
+	trafSecConn  = 3
 
 	modeList    = 0
 	modeForm    = 1
@@ -88,10 +96,12 @@ type rootModel struct {
 	sysctls   []pkgapi.SysctlSpec
 	ipLists   []pkgapi.IPList
 	dataplane *pkgapi.Dataplane
+	traffic   *pkgapi.TrafficSnapshot
 	cursor    int
 	scroll    int
 	ipSection int // addrs | rules | links
 	listSec   int // 0=browse lists, 1=entries of selected list (easy)
+	trafSec   int // iface | ip | port | conn
 
 	err        string
 	statusLine string
@@ -139,13 +149,15 @@ func newRootModel(cfg Config) rootModel {
 
 func (m rootModel) beginFetch() (rootModel, tea.Cmd) {
 	m.fetchGen++
-	withHost := false
+	withHost, withTraffic := false, false
 	if m.uiEasy {
 		withHost = m.tab == easyLive || m.tab == easyHome || m.tab == easyConfig
+		withTraffic = m.tab == easyTraffic || m.tab == easyHome
 	} else {
 		withHost = m.tab == tabPlane || m.tab == tabStatus
+		withTraffic = m.tab == tabTraffic || m.tab == tabStatus
 	}
-	return m, fetchData(m.cfg.Client, m.fetchGen, withHost)
+	return m, fetchData(m.cfg.Client, m.fetchGen, withHost, withTraffic)
 }
 
 func (m rootModel) startMutate(cmd tea.Cmd) (tea.Model, tea.Cmd) {
@@ -163,7 +175,7 @@ func (m rootModel) setFlash(s string) (rootModel, tea.Cmd) {
 }
 
 func (m rootModel) Init() tea.Cmd {
-	return tea.Batch(fetchData(m.cfg.Client, m.fetchGen, true), tickCmd(m.cfg.RefreshInterval))
+	return tea.Batch(fetchData(m.cfg.Client, m.fetchGen, true, true), tickCmd(m.cfg.RefreshInterval))
 }
 
 func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -179,7 +191,14 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		if m.mode == modeList || m.mode == modeDetail {
 			m, fetch := m.beginFetch()
-			return m, tea.Batch(fetch, tickCmd(m.cfg.RefreshInterval))
+			// Faster refresh on traffic tab for live rates.
+			iv := m.cfg.RefreshInterval
+			if (!m.uiEasy && m.tab == tabTraffic) || (m.uiEasy && m.tab == easyTraffic) {
+				if iv > time.Second {
+					iv = time.Second
+				}
+			}
+			return m, tea.Batch(fetch, tickCmd(iv))
 		}
 		return m, tickCmd(m.cfg.RefreshInterval)
 
@@ -212,6 +231,9 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ipLists = msg.ipLists
 			if msg.dataplane != nil {
 				m.dataplane = msg.dataplane
+			}
+			if msg.traffic != nil {
+				m.traffic = msg.traffic
 			}
 			if msg.status.LastApply != nil {
 				m.lastApply = msg.status.LastApply
@@ -368,6 +390,8 @@ func (m rootModel) rowCount() int {
 		}
 	case tabTC:
 		return len(m.tc)
+	case tabTraffic:
+		return m.trafficRowCount()
 	case tabPlane:
 		return m.planeLineCount()
 	default:
@@ -613,24 +637,44 @@ func (m rootModel) handleListKey(key string) (tea.Model, tea.Cmd) {
 	case "8":
 		m.tab, m.cursor, m.scroll = tabTC, 0, 0
 	case "9":
+		m.tab, m.cursor, m.scroll = tabTraffic, 0, 0
+		m, fetch := m.beginFetch()
+		return m, fetch
+	case "0":
 		m.tab, m.cursor, m.scroll = tabPlane, 0, 0
 		m, fetch := m.beginFetch()
 		return m, fetch
 	case "tab", "right", "l":
 		m.tab = (m.tab + 1) % tabCount
 		m.cursor, m.scroll = 0, 0
+		if m.tab == tabTraffic || m.tab == tabPlane {
+			m, fetch := m.beginFetch()
+			return m, fetch
+		}
 	case "shift+tab", "left", "h":
 		m.tab = (m.tab + tabCount - 1) % tabCount
 		m.cursor, m.scroll = 0, 0
+		if m.tab == tabTraffic || m.tab == tabPlane {
+			m, fetch := m.beginFetch()
+			return m, fetch
+		}
 	case "[":
 		if m.tab == tabIP {
 			m.ipSection = (m.ipSection + 2) % 3
 			m.cursor = 0
 		}
+		if m.tab == tabTraffic {
+			m.trafSec = (m.trafSec + 3) % 4
+			m.cursor, m.scroll = 0, 0
+		}
 	case "]":
 		if m.tab == tabIP {
 			m.ipSection = (m.ipSection + 1) % 3
 			m.cursor = 0
+		}
+		if m.tab == tabTraffic {
+			m.trafSec = (m.trafSec + 1) % 4
+			m.cursor, m.scroll = 0, 0
 		}
 	case "j", "down":
 		if m.tab == tabPlane || m.tab == tabStatus {
@@ -1322,6 +1366,8 @@ func (m rootModel) View() string {
 				b.WriteString(m.viewIP())
 			case tabTC:
 				b.WriteString(m.viewTC())
+			case tabTraffic:
+				b.WriteString(m.viewTraffic())
 			case tabPlane:
 				b.WriteString(m.viewDataplane())
 			}
@@ -1352,7 +1398,7 @@ func (m rootModel) listHelp() string {
 	if m.uiEasy {
 		return m.easyListHelp()
 	}
-	base := "1-9 tabs · j/k · enter detail · n new · r refresh · a apply · A dry-run · m easy · q quit"
+	base := "1-9/0 tabs · j/k · enter · n new · r refresh · a apply · m easy · q quit"
 	switch m.tab {
 	case tabPolicies:
 		return base + " · e edit · t toggle · D delete"
@@ -1360,23 +1406,30 @@ func (m rootModel) listHelp() string {
 		return base + " · D delete"
 	case tabIP:
 		return base + " · [/] section (addrs/rules/links) · D delete"
+	case tabTraffic:
+		return "9 Traffic · [/] iface|ip|port|conn · j/k · r refresh (1s) · m easy · q quit"
 	case tabStatus:
 		return base + " · f toggle ip_forward · enter last apply"
 	case tabPlane:
-		return base + " · j/k/pg scroll"
+		return "0 Dataplane · j/k/pg scroll · r refresh · m easy · q quit"
 	default:
 		return base
 	}
 }
 
 func (m rootModel) renderTabs() string {
-	names := []string{"Status", "Pol", "Route", "NAT", "Fwd", "FW", "IP", "TC", "Plane"}
-	if m.width >= 110 {
-		names = []string{"Status", "Policies", "Routes", "NAT", "Forwards", "Firewall", "IP", "TC", "Dataplane"}
+	names := []string{"Status", "Pol", "Route", "NAT", "Fwd", "FW", "IP", "TC", "Traf", "Plane"}
+	if m.width >= 120 {
+		names = []string{"Status", "Policies", "Routes", "NAT", "Forwards", "Firewall", "IP", "TC", "Traffic", "Dataplane"}
 	}
 	parts := make([]string, len(names))
 	for i, n := range names {
-		label := fmt.Sprintf("%d %s", i+1, n)
+		// 1–9 then 0 for dataplane (key binding).
+		num := i + 1
+		if i == tabPlane {
+			num = 0
+		}
+		label := fmt.Sprintf("%d %s", num, n)
 		if i == m.tab {
 			parts[i] = tabActive.Render(label)
 		} else {
@@ -1437,6 +1490,7 @@ func (m rootModel) viewStatus() string {
 			tool("tc", st.TCAvailable) + " " +
 			tool("iptables", st.IptablesAvailable) + "\n\n" +
 			fwd + "  " + applyOK + "\n\n" +
+			m.viewTrafficSummary() + "\n\n" +
 			helpStyle.Render("f = toggle ip_forward   ·   a = apply   ·   A = dry-run   ·   enter = last apply"),
 	))
 

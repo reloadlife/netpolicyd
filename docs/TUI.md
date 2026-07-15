@@ -29,13 +29,14 @@ Plain-language jobs. No tables/chains unless you switch to advanced.
 | **5 Lists** | Named IP/CIDR groups |
 | **6 Config** | IP forward, routing, routes, sysctls |
 | **7 Speed** | Bandwidth limits (bits/s, e.g. `50mbit`) |
-| **8 Live** | Live host dump |
+| **8 Traffic** | Live throughput: interfaces · by IP · by port · connections |
+| **9 Live** | Live host dump (nft / routes / tc) |
 
 ### Global keys (easy)
 
 | Key | Action |
 |-----|--------|
-| `1`–`8` / tab | Switch tab |
+| `1`–`9` / tab | Switch tab |
 | `n` | New / wizard |
 | `j` `k` | Move / scroll |
 | `enter` | Detail |
@@ -58,6 +59,7 @@ Plain-language jobs. No tables/chains unless you switch to advanced.
 | `b` | Home / Block | Quick block wizard |
 | `i` | Lists | Add IPs to selected list |
 | `t` | Fastpath | Toggle rule on/off |
+| `[` `]` | Traffic | Cycle iface → IP → port → connections |
 
 ### Typical gateway flow
 
@@ -76,7 +78,7 @@ Full operator surface.
 
 | Tab | Contents |
 |-----|----------|
-| 1 Status | Backend, tools, counts, last apply |
+| 1 Status | Backend, tools, counts, last apply, live RX/TX strip |
 | 2 Policies | Full policy CRUD |
 | 3 Routes | Explicit routes |
 | 4 NAT | Masquerade / SNAT |
@@ -84,7 +86,10 @@ Full operator surface.
 | 6 Firewall | filter/nat/mangle · nft or iptables |
 | 7 IP | addrs / rules / links (`[` `]` section) |
 | 8 TC | Bandwidth |
-| 9 Dataplane | Full host dump |
+| 9 Traffic | Live RX/TX per iface; sockets by IP/port; connections (`[` `]`) |
+| 0 Dataplane | Full host dump |
+
+**Traffic tab:** rates from `/proc/net/dev` deltas (1s refresh while open). IP / port / connections from `ss` (iproute2). Byte counters on established TCP when `ss -i` is available.
 
 Keys: `n` new · `e` edit · `t` toggle · `D` delete · `a`/`A` apply · `m` easy · `q` quit.
 
@@ -106,8 +111,11 @@ netpolicyctl lists
 netpolicyctl ip [addrs|rules|links]
 netpolicyctl overview
 netpolicyctl dataplane
+netpolicyctl traffic
 netpolicyctl apply [--dry-run]
 netpolicyctl version
 ```
 
 Add `--json` / `-j` on list commands where tables are default.
+
+`netpolicyctl traffic` prints interface rates plus top IPs, ports, and sockets (rates need two samples ~1s apart on the server for non-zero bps).
