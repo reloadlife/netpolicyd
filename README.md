@@ -1,23 +1,30 @@
 # netpolicyd
 
-Host **network policy** daemon: policy routing, firewall, NAT, addresses, and traffic control.
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/reloadlife/netpolicyd)](https://github.com/reloadlife/netpolicyd/releases)
 
-Controlled only over HTTP (Bearer token). Companion CLI + TUI: **netpolicyctl**.
+**netpolicyd** is a Linux **host network policy** daemon: desired-state routing, firewall, NAT, addresses, traffic control, and sysctls, applied through `ip` / `nft` / `iptables` / `tc`.
+
+**netpolicyctl** is the control panel: easy/advanced full-screen TUI plus CLI.
+
+How it works: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## What it manages
 
 | Surface | Tools |
 |---------|--------|
-| **Policies** | Ordered rules — e.g. client CIDR exits via a tunnel |
+| **Policies** | Ordered rules expanded to policy routes / egress |
 | **Routes / IP rules** | `ip route`, `ip rule` |
 | **Addresses / links** | `ip addr`, `ip link` |
 | **Firewall** | `nft` (preferred) or `iptables` |
-| **NAT** | Masquerade / SNAT |
-| **IP lists** | Named groups of IPs/CIDRs for bulk rules |
+| **NAT** | Masquerade / SNAT (CIDR or IP lists) |
+| **IP lists** | Named groups of IPs/CIDRs |
 | **TC** | HTB + ingress police (bits/s) |
 | **Sysctl** | `ip_forward`, `rp_filter`, … |
+| **Traffic** | Live RX/TX rates, sockets by IP/port/connection |
+| **Dataplane** | Live host dump of firewall/routing |
 
-Apply is **idempotent** for managed firewall state: chains are flushed, then rebuilt from desired config (no stacked duplicate rules).
+Apply is **idempotent** for managed firewall state: owned chains are flushed, then rebuilt from desired config.
 
 ## Quick start
 
@@ -31,12 +38,12 @@ export NETPOLICYCTL_URL=http://127.0.0.1:51910 NETPOLICYCTL_TOKEN=dev-token
 ./bin/netpolicyctl apply --dry-run
 ```
 
-## Example: user via GRE
+## Example: source-based egress
 
 ```bash
 curl -s -H "Authorization: Bearer dev-token" -H 'Content-Type: application/json' \
   -d '{
-    "name": "user4-via-gre-lab",
+    "name": "src-via-gre-lab",
     "priority": 10,
     "subjects": [{"kind":"cidr","value":"10.77.0.4/32"}],
     "destination": {"kind":"any","value":"0.0.0.0/0"},
@@ -44,30 +51,21 @@ curl -s -H "Authorization: Bearer dev-token" -H 'Content-Type: application/json'
     "egress_name": "gre-lab",
     "source_cidr": "10.77.0.4/32"
   }' http://127.0.0.1:51910/v1/policies
+
+./bin/netpolicyctl apply
 ```
 
-Roughly applies:
-
-```sh
-ip route replace default dev gre-lab table 100
-ip rule add from 10.77.0.4/32 table 100 priority …
-nft flush chain inet netpolicyd postrouting
-nft add rule inet netpolicyd postrouting ip saddr 10.77.0.4/32 oifname "gre-lab" masquerade …
-sysctl -w net.ipv4.ip_forward=1
-```
+Roughly plans `ip rule` / table default via `gre-lab`, optional masquerade, and related firewall.
 
 ## netpolicyctl
 
 | Mode | Start |
 |------|--------|
 | **Easy** (default) | `netpolicyctl` · `NETPOLICYCTL_MODE=easy` |
-| **Advanced** | `netpolicyctl --advanced` · toggle with **`m`** in TUI |
+| **Advanced** | `netpolicyctl --advanced` · toggle **`m`** in TUI |
 
-**Easy tabs:** Home · Fastpath · Masq · Block/Allow · Lists · Config · Speed · **Traffic** · Live  
-
-**Traffic tab:** live RX/TX per interface (from `/proc/net/dev`), sockets by IP / port, and connection list (`ss`). `[` `]` cycle sections; auto-refreshes ~1s while open.
-
-**Advanced tabs:** Status · Policies · Routes · NAT · Forwards · Firewall · IP · TC · Dataplane  
+**Easy:** Home · Fastpath · Masq · Block/Allow · Lists · Config · Speed · Traffic · Live  
+**Advanced:** Status · Policies · Routes · NAT · Forwards · Firewall · IP · TC · Traffic · Dataplane  
 
 See [docs/TUI.md](docs/TUI.md).
 
@@ -78,33 +76,34 @@ Auth: `Authorization: Bearer <token>` on `/v1/*`.
 | Area | Paths |
 |------|--------|
 | Health | `GET /healthz` |
-| Status | `GET /v1/status` · `GET /v1/overview` · `GET /v1/dataplane` · `GET /v1/traffic` |
-| Desired | `PUT /v1/desired` · `POST /v1/apply?dry_run=1` |
-| Policies | `/v1/policies` |
-| Routes / NAT / Forwards | `/v1/routes` · `/v1/nat` · `/v1/forwards` |
-| Firewall | `/v1/firewall` |
-| IP | `/v1/ip/addrs` · `/v1/ip/rules` · `/v1/ip/links` · `/v1/ip/lists` |
-| TC | `/v1/tc` |
-| Sysctl | `/v1/sysctl` · `/v1/sysctl/ip_forward` |
+| Status | `GET /v1/status` · `/v1/overview` · `/v1/dataplane` · `/v1/traffic` |
+| Desired | `PUT /v1/desired` · `POST /v1/apply` |
+| Objects | `/v1/policies` · `/v1/routes` · `/v1/nat` · `/v1/forwards` · `/v1/firewall` · `/v1/ip/*` · `/v1/tc` · `/v1/sysctl` |
 | Metrics | `GET /metrics` |
-
-Full reference: [docs/API.md](docs/API.md).
 
 ## Documentation
 
-| Doc | |
-|-----|--|
-| [docs/INSTALL.md](docs/INSTALL.md) | Build, install, systemd |
+| Doc | Contents |
+|-----|----------|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How netpolicyd works |
 | [docs/API.md](docs/API.md) | HTTP contract |
 | [docs/TUI.md](docs/TUI.md) | Easy / advanced UI |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Flags, env, apply model, sysctls |
-| [configs/](configs/) | Example env files |
-| [deploy/netpolicyd.service](deploy/netpolicyd.service) | systemd unit |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Flags, env, apply model |
+| [docs/INSTALL.md](docs/INSTALL.md) | Build, install, systemd |
+| [docs/SECURITY.md](docs/SECURITY.md) | Hardening notes |
 
-## Why “netpolicyd”?
+## Donations
 
-systemd’s **firewalld** already owns that name. This daemon is a focused control-plane target for host policy + routing + NAT + TC over a small HTTP API.
+If this project is useful to you, donations are welcome:
+
+| Network | Address |
+|---------|---------|
+| **Bitcoin** (BTC) | `bc1qy08pk2teys968hphh98rv8y9azeraf2c8vsdm8` |
+| **EVM** (ETH, BNB, USDT, and other EVM chains) | `0x8B6CE1EA8F17f6941F13A621b92Af345a75D8c41` |
+| **TRON** (TRX) | `TGXJToyAsUtw1388jR5aW9ZohjSCDtmKbg` |
 
 ## License
 
-See repository root if a LICENSE file is present; otherwise treat as private/internal unless stated.
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).
+
+If you run a modified version of `netpolicyd` as a network service, you must offer the corresponding source to users who interact with it over the network (AGPL §13).
