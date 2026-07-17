@@ -129,6 +129,7 @@ type rootModel struct {
 	lastApply *pkgapi.ApplyResult
 
 	fetchGen uint64
+	fetching bool // a host/traffic dump is in flight — don't stack another
 	busy     bool
 	flashID  int
 }
@@ -148,6 +149,10 @@ func newRootModel(cfg Config) rootModel {
 }
 
 func (m rootModel) beginFetch() (rootModel, tea.Cmd) {
+	if m.fetching {
+		return m, nil // one in flight; the periodic tick re-arms later
+	}
+	m.fetching = true
 	m.fetchGen++
 	withHost, withTraffic := false, false
 	if m.uiEasy {
@@ -209,6 +214,7 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case dataMsg:
+		m.fetching = false // clear for any response (matching or stale) so it can't stick
 		if msg.gen != m.fetchGen {
 			return m, nil
 		}
@@ -692,7 +698,7 @@ func (m rootModel) handleListKey(key string) (tea.Model, tea.Cmd) {
 		if m.tab == tabPlane {
 			m.scroll += 10
 		} else {
-			m.cursor = min(m.rowCount()-1, m.cursor+10)
+			m.cursor = max(0, min(m.rowCount()-1, m.cursor+10))
 		}
 	case "pgup":
 		if m.tab == tabPlane {

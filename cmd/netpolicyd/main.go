@@ -6,9 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/reloadlife/netpolicyd/internal/api"
 	"github.com/reloadlife/netpolicyd/internal/apply"
@@ -25,9 +27,20 @@ func main() {
 	}
 
 	listen := flag.String("listen", "127.0.0.1:51910", "HTTP listen address")
-	token := flag.String("token", "dev-token", "Bearer token for /v1/*")
+	token := flag.String("token", "", "Bearer token for /v1/* (or env NETPOLICYD_TOKEN)")
 	mock := flag.Bool("mock", false, "Force mock apply (do not exec ip/nft)")
 	flag.Parse()
+
+	tok := *token
+	if tok == "" {
+		tok = os.Getenv("NETPOLICYD_TOKEN")
+	}
+	if !isLoopback(*listen) && (tok == "" || tok == "dev-token") {
+		log.Fatal("refusing to listen on a non-loopback address without a strong token: set NETPOLICYD_TOKEN")
+	}
+	if tok == "" {
+		log.Printf("WARNING: no token set — /v1 auth is DISABLED (loopback only)")
+	}
 
 	// Auto-mock only when no ip binary (PATH may omit /usr/sbin; Detect checks sbin)
 	ipOK, nftOK, tcOK := apply.Detect()
@@ -44,15 +57,36 @@ func main() {
 	srv := &api.Server{
 		Store:   st,
 		Runner:  runner,
-		Token:   *token,
+		Token:   tok,
 		Version: version,
 	}
 
 	log.Printf("netpolicyd %s listening on %s backend=%s go=%s",
 		version, *listen, runner.Backend, runtime.Version())
-	if err := http.ListenAndServe(*listen, logRequest(srv.Handler())); err != nil {
+	srv2 := &http.Server{
+		Addr:              *listen,
+		Handler:           logRequest(srv.Handler()),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv2.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// isLoopback reports whether addr's host is a loopback/localhost address.
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	switch host {
+	case "127.0.0.1", "::1", "localhost", "":
+		return true
+	}
+	return false
 }
 
 func logRequest(next http.Handler) http.Handler {

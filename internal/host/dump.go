@@ -4,6 +4,7 @@ package host
 import (
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,24 +51,17 @@ func Collect() Dump {
 			d.IPRulesRaw = out
 			d.IPRules = splitNonEmpty(out)
 		}
-		if out, err := run("ip", "route", "show"); err != nil {
-			d.IPRoutesMain = out
-		} else {
-			d.IPRoutesMain = out
-		}
+		d.IPRoutesMain, _ = run("ip", "route", "show")
 		if out, err := run("ip", "route", "show", "table", "all"); err != nil {
 			d.IPRoutesAllErr = err.Error()
 			d.IPRoutesAll = out
 		} else {
 			d.IPRoutesAll = out
 		}
-		// netpolicyd custom tables 100–120
-		for tid := 100; tid <= 120; tid++ {
-			out, err := run("ip", "route", "show", "table", itoa(tid))
-			if err != nil || strings.TrimSpace(out) == "" {
-				continue
-			}
-			d.IPRouteTables[itoa(tid)] = out
+		// netpolicyd custom tables 100–120: parse the already-fetched
+		// `table all` dump instead of forking `ip route` 21 more times.
+		for id, routes := range parseRouteTables(d.IPRoutesAll) {
+			d.IPRouteTables[id] = routes
 		}
 	}
 
@@ -175,6 +169,45 @@ func Collect() Dump {
 	}
 
 	return d
+}
+
+// parseRouteTables groups lines of `ip route show table all` by their
+// `table <id>` token, keeping only numeric ids in [100,120] (netpolicyd's
+// custom tables). Avoids forking `ip route` once per table id.
+func parseRouteTables(routesAll string) map[string]string {
+	byID := map[string][]string{}
+	for _, line := range strings.Split(routesAll, "\n") {
+		fields := strings.Fields(line)
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] != "table" {
+				continue
+			}
+			id := fields[i+1]
+			if isRouteTableID(id) {
+				byID[id] = append(byID[id], line)
+			}
+			break
+		}
+	}
+	out := make(map[string]string, len(byID))
+	for id, lines := range byID {
+		out[id] = strings.Join(lines, "\n")
+	}
+	return out
+}
+
+// isRouteTableID reports whether s is an all-digit id in [100,120].
+func isRouteTableID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 100 && n <= 120
 }
 
 // tcDevFromQdiscLine extracts device name from `tc qdisc show` line.

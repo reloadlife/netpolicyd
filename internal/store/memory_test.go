@@ -80,11 +80,17 @@ func TestSnapshotIncludesListsAndSysctl(t *testing.T) {
 
 func TestNATAndRoute(t *testing.T) {
 	m := New()
-	n := m.UpsertNAT(api.NATSpec{Kind: "masquerade", SourceCIDR: "10.0.0.0/8", OutIface: "ens18", Enabled: true})
+	n, err := m.UpsertNAT(api.NATSpec{Kind: "masquerade", SourceCIDR: "10.0.0.0/8", OutIface: "ens18", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if n.ID == "" {
 		t.Fatal("id")
 	}
-	rt := m.UpsertRoute(api.RouteSpec{Table: "main", Dst: "default", Device: "ens18", Enabled: true})
+	rt, err := m.UpsertRoute(api.RouteSpec{Table: "main", Dst: "default", Device: "ens18", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if rt.ID == "" {
 		t.Fatal("route id")
 	}

@@ -33,9 +33,11 @@ var (
 // CollectTraffic builds a live throughput + connection snapshot.
 // Interface rates use delta vs previous CollectTraffic call (process-local).
 func CollectTraffic() pkg.TrafficSnapshot {
-	now := time.Now().UTC()
+	// mono keeps the monotonic reading for interval math; .UTC() strips it,
+	// so an NTP step would otherwise fake multi-Gbit spikes or zero rates.
+	mono := time.Now()
 	snap := pkg.TrafficSnapshot{
-		CollectedAt: now.Format(time.RFC3339),
+		CollectedAt: time.Now().UTC().Format(time.RFC3339),
 		SSAvailable: hasBin("ss"),
 	}
 
@@ -49,7 +51,7 @@ func CollectTraffic() pkg.TrafficSnapshot {
 	prev := trafficLast
 	var interval float64
 	if !prev.at.IsZero() {
-		interval = now.Sub(prev.at).Seconds()
+		interval = mono.Sub(prev.at).Seconds()
 		if interval < 0.05 {
 			interval = 0.05
 		}
@@ -58,6 +60,11 @@ func CollectTraffic() pkg.TrafficSnapshot {
 	// rates
 	var list []pkg.IfaceTraffic
 	for name, cur := range curIfaces {
+		// always skip uninteresting ifaces (lo/docker0/veth/br-…): counting a
+		// busy one double-counts into TotalRxBps/TotalTxBps.
+		if !interestingIface(name) {
+			continue
+		}
 		it := pkg.IfaceTraffic{
 			Name: name, RxBytes: cur.rxB, TxBytes: cur.txB,
 			RxPackets: cur.rxP, TxPackets: cur.txP,
@@ -68,17 +75,20 @@ func CollectTraffic() pkg.TrafficSnapshot {
 				it.TxBps = float64(cur.txB-p.txB) * 8 / interval
 				it.RxPps = float64(cur.rxP-p.rxP) / interval
 				it.TxPps = float64(cur.txP-p.txP) / interval
+				// clamp on counter reset / iface down-up (negative delta)
 				if it.RxBps < 0 {
 					it.RxBps = 0
 				}
 				if it.TxBps < 0 {
 					it.TxBps = 0
 				}
+				if it.RxPps < 0 {
+					it.RxPps = 0
+				}
+				if it.TxPps < 0 {
+					it.TxPps = 0
+				}
 			}
-		}
-		// skip empty virtuals with zero forever unless named interesting
-		if cur.rxB == 0 && cur.txB == 0 && !interestingIface(name) {
-			continue
 		}
 		list = append(list, it)
 		snap.TotalRxBps += it.RxBps
@@ -93,7 +103,11 @@ func CollectTraffic() pkg.TrafficSnapshot {
 		return list[i].Name < list[j].Name
 	})
 	snap.Interfaces = list
-	trafficLast = trafficPrev{at: now, ifaces: curIfaces}
+	// only advance the baseline on a good read; a transient /proc failure
+	// returns an empty map and would zero the next poll's rates.
+	if err == nil {
+		trafficLast = trafficPrev{at: mono, ifaces: curIfaces}
+	}
 	trafficMu.Unlock()
 
 	// --- sockets ---
@@ -102,7 +116,8 @@ func CollectTraffic() pkg.TrafficSnapshot {
 		if e != nil && snap.Error == "" {
 			snap.Error = e.Error()
 		}
-		snap.Connections = conns
+		// counts + aggregates over the FULL slice; only the per-connection
+		// list is capped, so a 5000-socket host still reports real totals.
 		for _, c := range conns {
 			snap.TotalConns++
 			st := strings.ToUpper(c.State)
@@ -115,6 +130,11 @@ func CollectTraffic() pkg.TrafficSnapshot {
 		}
 		snap.ByIP = aggregateByIP(conns)
 		snap.ByPort = aggregateByPort(conns)
+		const maxConns = 200
+		if len(conns) > maxConns {
+			conns = conns[:maxConns]
+		}
+		snap.Connections = conns
 	}
 
 	return snap
@@ -173,29 +193,42 @@ var (
 )
 
 // collectSS parses TCP/UDP sockets via ss. Prefer -i for byte counters on ESTAB.
+// Returns the FULL sorted slice (no truncation) so callers can compute accurate
+// aggregates; truncate only the per-connection list for the API.
 func collectSS() ([]pkg.ConnTraffic, error) {
 	// TCP with internal info (bytes) for established; then plain for listen/udp.
 	var all []pkg.ConnTraffic
 	richESTAB := 0
+	anyOK := false
+	var lastErr error
 	// When filtered with "state established", ss omits the State column:
 	//   Recv-Q Send-Q Local Peer
 	// With -i, each socket is followed by a cubic/info line (bytes_sent, …).
 	if out, err := runSS("-Hti", "state", "established"); err == nil {
+		anyOK = true
 		parsed := parseSSTI(out, "tcp", "ESTAB")
 		all = append(all, parsed...)
 		richESTAB = len(parsed)
+	} else {
+		lastErr = err
 	}
 	// Full TCP table (state column present). Skip ESTAB if we already have rich rows.
 	if out, err := runSS("-Htan"); err == nil {
+		anyOK = true
 		for _, c := range parseSSPlain(out, "tcp") {
 			if richESTAB > 0 && (strings.EqualFold(c.State, "ESTAB") || strings.EqualFold(c.State, "ESTABLISHED")) {
 				continue
 			}
 			all = append(all, c)
 		}
+	} else {
+		lastErr = err
 	}
 	if out, err := runSS("-Huan"); err == nil {
+		anyOK = true
 		all = append(all, parseSSPlain(out, "udp")...)
+	} else {
+		lastErr = err
 	}
 	// sort: established with traffic first
 	sort.Slice(all, func(i, j int) bool {
@@ -206,10 +239,10 @@ func collectSS() ([]pkg.ConnTraffic, error) {
 		}
 		return all[i].LocalPort < all[j].LocalPort
 	})
-	// cap list for API size
-	const maxConns = 200
-	if len(all) > maxConns {
-		all = all[:maxConns]
+	// If every invocation failed, surface the error so the UI doesn't show
+	// total_conns:0 on a busy box as if all were quiet.
+	if !anyOK {
+		return all, lastErr
 	}
 	return all, nil
 }

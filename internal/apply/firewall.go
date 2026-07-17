@@ -72,36 +72,14 @@ func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.Fo
 	mock := !nftOK && !iptOK
 
 	var cmds []string
-	needNFT, needIPT := false, false
-	for _, r := range all {
-		if !r.Enabled {
-			continue
-		}
-		be := strings.ToLower(r.Backend)
-		if be == "" || be == "auto" {
-			if nftOK || mock {
-				be = "nft"
-			} else {
-				be = "iptables"
-			}
-		}
-		switch be {
-		case "nft":
-			needNFT = true
-		case "iptables":
-			needIPT = true
-		}
-	}
-	// Always ensure/flush nft table when we have any managed rules, or when
-	// cleaning previous state (needNFT). If no rules but table exists, still
-	// flush so deleted rules disappear from the host.
+	// Always ensure+flush managed chains whenever the backend is usable, even
+	// when no rule currently targets it — deleting the last nft/iptables rule
+	// must still flush the managed chains so stale rules disappear from the host.
 	if nftOK || mock {
-		if needNFT || len(all) == 0 {
-			cmds = append(cmds, ensureNFTBase()...)
-			cmds = append(cmds, flushNFTChains()...)
-		}
+		cmds = append(cmds, ensureNFTBase()...)
+		cmds = append(cmds, flushNFTChains()...)
 	}
-	if needIPT && (iptOK || mock) {
+	if iptOK || mock {
 		cmds = append(cmds, ensureIptablesBase()...)
 	}
 

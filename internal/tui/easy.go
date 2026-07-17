@@ -205,7 +205,7 @@ func (m rootModel) handleEasyListKey(key string) (tea.Model, tea.Cmd) {
 		if m.tab == easyLive {
 			m.scroll += 10
 		} else {
-			m.cursor = min(m.easyRowCount()-1, m.cursor+10)
+			m.cursor = max(0, min(m.easyRowCount()-1, m.cursor+10))
 		}
 	case "pgup":
 		if m.tab == easyLive {

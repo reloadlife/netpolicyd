@@ -32,6 +32,22 @@ type Memory struct {
 	ipForward   bool
 }
 
+// Counts holds collection sizes for status without copying/sorting the store.
+type Counts struct {
+	Policies, Routes, NAT, Forwards, TC, Firewall, IPAddrs, IPRules, Links, Sysctls, IPLists int
+}
+
+func (m *Memory) Counts() Counts {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return Counts{
+		Policies: len(m.policies), Routes: len(m.routes), NAT: len(m.nat),
+		Forwards: len(m.forwards), TC: len(m.tc), Firewall: len(m.firewall),
+		IPAddrs: len(m.ipAddrs), IPRules: len(m.ipRules), Links: len(m.links),
+		Sysctls: len(m.sysctls), IPLists: len(m.ipLists),
+	}
+}
+
 func New() *Memory {
 	return &Memory{
 		policies:  make(map[string]*api.PolicyRule),
@@ -117,6 +133,9 @@ func (m *Memory) CreatePolicy(req api.PolicyCreateRequest) (api.PolicyRule, erro
 	if p.Priority == 0 {
 		p.Priority = 100
 	}
+	if err := validatePolicy(*p); err != nil {
+		return api.PolicyRule{}, err
+	}
 	m.policies[p.ID] = p
 	return *p, nil
 }
@@ -124,45 +143,50 @@ func (m *Memory) CreatePolicy(req api.PolicyCreateRequest) (api.PolicyRule, erro
 func (m *Memory) UpdatePolicy(id string, req api.PolicyUpdateRequest) (api.PolicyRule, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	p, ok := m.policies[id]
+	cur, ok := m.policies[id]
 	if !ok {
 		return api.PolicyRule{}, fmt.Errorf("not found")
 	}
+	merged := *cur
 	if req.Priority != nil {
-		p.Priority = *req.Priority
+		merged.Priority = *req.Priority
 	}
 	if req.Name != nil {
-		p.Name = *req.Name
+		merged.Name = *req.Name
 	}
 	if req.Enabled != nil {
-		p.Enabled = *req.Enabled
+		merged.Enabled = *req.Enabled
 	}
 	if req.Subjects != nil {
-		p.Subjects = req.Subjects
+		merged.Subjects = req.Subjects
 	}
 	if req.Destination != nil {
-		p.Destination = *req.Destination
+		merged.Destination = *req.Destination
 	}
 	if req.Action != nil {
-		p.Action = *req.Action
+		merged.Action = *req.Action
 	}
 	if req.EgressName != nil {
-		p.EgressName = *req.EgressName
+		merged.EgressName = *req.EgressName
 	}
 	if req.Mark != nil {
-		p.Mark = *req.Mark
+		merged.Mark = *req.Mark
 	}
 	if req.Table != nil {
-		p.Table = *req.Table
+		merged.Table = *req.Table
 	}
 	if req.SourceCIDR != nil {
-		p.SourceCIDR = *req.SourceCIDR
+		merged.SourceCIDR = *req.SourceCIDR
 	}
 	if req.Description != nil {
-		p.Description = *req.Description
+		merged.Description = *req.Description
 	}
-	p.UpdatedAt = time.Now().UTC()
-	return *p, nil
+	merged.UpdatedAt = time.Now().UTC()
+	if err := validatePolicy(merged); err != nil {
+		return api.PolicyRule{}, err
+	}
+	*cur = merged
+	return *cur, nil
 }
 
 func (m *Memory) DeletePolicy(id string) error {
@@ -199,7 +223,10 @@ func (m *Memory) ListRoutes() []api.RouteSpec {
 	return out
 }
 
-func (m *Memory) UpsertRoute(r api.RouteSpec) api.RouteSpec {
+func (m *Memory) UpsertRoute(r api.RouteSpec) (api.RouteSpec, error) {
+	if err := validateRoute(r); err != nil {
+		return api.RouteSpec{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if r.ID == "" {
@@ -207,7 +234,7 @@ func (m *Memory) UpsertRoute(r api.RouteSpec) api.RouteSpec {
 	}
 	cp := r
 	m.routes[cp.ID] = &cp
-	return cp
+	return cp, nil
 }
 
 func (m *Memory) DeleteRoute(id string) error {
@@ -230,18 +257,21 @@ func (m *Memory) ListNAT() []api.NATSpec {
 	return out
 }
 
-func (m *Memory) UpsertNAT(n api.NATSpec) api.NATSpec {
+func (m *Memory) UpsertNAT(n api.NATSpec) (api.NATSpec, error) {
+	if n.Kind == "" {
+		n.Kind = "masquerade"
+	}
+	if err := validateNAT(n); err != nil {
+		return api.NATSpec{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if n.ID == "" {
 		n.ID = "nat-" + uuid.NewString()[:8]
 	}
-	if n.Kind == "" {
-		n.Kind = "masquerade"
-	}
 	cp := n
 	m.nat[cp.ID] = &cp
-	return cp
+	return cp, nil
 }
 
 func (m *Memory) DeleteNAT(id string) error {
@@ -264,7 +294,10 @@ func (m *Memory) ListForwards() []api.ForwardSpec {
 	return out
 }
 
-func (m *Memory) UpsertForward(f api.ForwardSpec) api.ForwardSpec {
+func (m *Memory) UpsertForward(f api.ForwardSpec) (api.ForwardSpec, error) {
+	if err := validateForward(f); err != nil {
+		return api.ForwardSpec{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if f.ID == "" {
@@ -272,7 +305,7 @@ func (m *Memory) UpsertForward(f api.ForwardSpec) api.ForwardSpec {
 	}
 	cp := f
 	m.forwards[cp.ID] = &cp
-	return cp
+	return cp, nil
 }
 
 func (m *Memory) DeleteForward(id string) error {
@@ -323,6 +356,9 @@ func (m *Memory) UpsertTC(t api.TCSpec) (api.TCSpec, error) {
 	}
 	if t.MatchKind != "any" && t.MatchValue == "" {
 		return api.TCSpec{}, fmt.Errorf("match_value required for match_kind=%s", t.MatchKind)
+	}
+	if err := validateTC(t); err != nil {
+		return api.TCSpec{}, err
 	}
 	if t.ID == "" {
 		t.ID = "tc-" + uuid.NewString()[:8]
@@ -378,6 +414,9 @@ func (m *Memory) UpsertFirewall(r api.FirewallRule) (api.FirewallRule, error) {
 	if r.Backend == "" {
 		r.Backend = "auto"
 	}
+	if err := validateFirewall(r); err != nil {
+		return api.FirewallRule{}, err
+	}
 	if r.ID == "" {
 		r.ID = "fw-" + uuid.NewString()[:8]
 	}
@@ -420,6 +459,9 @@ func (m *Memory) UpsertIPAddr(a api.IPAddrSpec) (api.IPAddrSpec, error) {
 	}
 	if a.CIDR == "" {
 		return api.IPAddrSpec{}, fmt.Errorf("cidr required")
+	}
+	if err := validateIPAddr(a); err != nil {
+		return api.IPAddrSpec{}, err
 	}
 	if a.ID == "" {
 		a.ID = "addr-" + uuid.NewString()[:8]
@@ -464,6 +506,9 @@ func (m *Memory) UpsertIPRule(r api.IPRuleSpec) (api.IPRuleSpec, error) {
 	if r.Action == "" {
 		r.Action = "lookup"
 	}
+	if err := validateIPRule(r); err != nil {
+		return api.IPRuleSpec{}, err
+	}
 	if r.ID == "" {
 		r.ID = "rule-" + uuid.NewString()[:8]
 	}
@@ -498,6 +543,9 @@ func (m *Memory) UpsertLink(l api.LinkSpec) (api.LinkSpec, error) {
 	defer m.mu.Unlock()
 	if l.Name == "" {
 		return api.LinkSpec{}, fmt.Errorf("name required")
+	}
+	if err := validateLink(l); err != nil {
+		return api.LinkSpec{}, err
 	}
 	if l.ID == "" {
 		l.ID = "link-" + uuid.NewString()[:8]
@@ -535,6 +583,9 @@ func (m *Memory) UpsertSysctl(s api.SysctlSpec) (api.SysctlSpec, error) {
 		return api.SysctlSpec{}, fmt.Errorf("key required")
 	}
 	s.Managed = true
+	if err := validateSysctl(s); err != nil {
+		return api.SysctlSpec{}, err
+	}
 	cp := s
 	m.sysctls[cp.Key] = &cp
 	return cp, nil
@@ -594,6 +645,9 @@ func (m *Memory) UpsertIPList(l api.IPList) (api.IPList, error) {
 		entries = append(entries, e)
 	}
 	l.Entries = entries
+	if err := validateIPList(l); err != nil {
+		return api.IPList{}, err
+	}
 	// unique name
 	for id, other := range m.ipLists {
 		if other.Name == l.Name && (l.ID == "" || id != l.ID) {

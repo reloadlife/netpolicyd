@@ -54,7 +54,10 @@ func TestTCUpsert(t *testing.T) {
 
 func TestForwardAndLink(t *testing.T) {
 	m := New()
-	f := m.UpsertForward(api.ForwardSpec{Action: "accept", InIface: "wg0", OutIface: "ens18", Enabled: true})
+	f, err := m.UpsertForward(api.ForwardSpec{Action: "accept", InIface: "wg0", OutIface: "ens18", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if f.ID == "" {
 		t.Fatal()
 	}

@@ -159,6 +159,8 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 			}
 			if p.Mark != 0 {
 				cmds = append(cmds, fmt.Sprintf(
+					"ip rule del fwmark %d table %d 2>/dev/null || true", p.Mark, tid))
+				cmds = append(cmds, fmt.Sprintf(
 					"ip rule add fwmark %d table %d priority %d", p.Mark, tid, 10000+p.Priority+1))
 			}
 		case api.ActionDeny:

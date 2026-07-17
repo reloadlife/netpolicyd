@@ -190,9 +190,9 @@ func splitMatchValues(value string) []string {
 // src_cidr / dst_cidr MatchValue may list multiple CIDRs; each gets a filter
 // with a distinct prio but the same flowid / police index (shared pool).
 //
-// Do NOT use bare "handle N:" — u32 requires HHHH:HH:HH and incomplete forms
-// yield "Illegal filter ID". Prefer prio uniqueness and omit handle, or use
-// a full 800:0:N handle.
+// u32 filters carry an explicit stable "handle 800::NN" so `tc filter replace`
+// truly replaces instead of adding a new duplicate every reconcile (unbounded
+// growth). The fw classifier instead takes the mark itself as its handle.
 func filterCmd(dev, parent string, pref int, handle uint32, r api.TCSpec, flowid, police string) []string {
 	kind := strings.ToLower(strings.TrimSpace(r.MatchKind))
 	value := strings.TrimSpace(r.MatchValue)
@@ -212,10 +212,10 @@ func filterCmd(dev, parent string, pref int, handle uint32, r api.TCSpec, flowid
 		if value == "" {
 			return nil
 		}
-		// fw classifier: handle is a single number (not u32 triple).
+		// fw classifier: the mark IS the handle; there is no "mark" keyword.
 		return []string{fmt.Sprintf(
-			"tc filter replace dev %s protocol all parent %s prio %d handle %d fw mark %s%s",
-			dev, parent, pref, handle&0xffff, normalizeMark(value), tail,
+			"tc filter replace dev %s protocol all parent %s prio %d handle %s fw%s",
+			dev, parent, pref, normalizeMark(value), tail,
 		)}
 	case "src_cidr":
 		vals := splitMatchValues(value)
@@ -228,9 +228,10 @@ func filterCmd(dev, parent string, pref int, handle uint32, r api.TCSpec, flowid
 			if p > 60000 {
 				p = 60000
 			}
+			nodeid := u32NodeID(handle, i)
 			out = append(out, fmt.Sprintf(
-				"tc filter replace dev %s protocol ip parent %s prio %d u32 match ip src %s%s",
-				dev, parent, p, ensureHostOrCIDR(v), tail,
+				"tc filter replace dev %s protocol ip parent %s prio %d handle 800::%x u32 match ip src %s%s",
+				dev, parent, p, nodeid, ensureHostOrCIDR(v), tail,
 			))
 		}
 		return out
@@ -245,18 +246,29 @@ func filterCmd(dev, parent string, pref int, handle uint32, r api.TCSpec, flowid
 			if p > 60000 {
 				p = 60000
 			}
+			nodeid := u32NodeID(handle, i)
 			out = append(out, fmt.Sprintf(
-				"tc filter replace dev %s protocol ip parent %s prio %d u32 match ip dst %s%s",
-				dev, parent, p, ensureHostOrCIDR(v), tail,
+				"tc filter replace dev %s protocol ip parent %s prio %d handle 800::%x u32 match ip dst %s%s",
+				dev, parent, p, nodeid, ensureHostOrCIDR(v), tail,
 			))
 		}
 		return out
 	default: // any
 		return []string{fmt.Sprintf(
-			"tc filter replace dev %s protocol ip parent %s prio %d u32 match u32 0 0%s",
-			dev, parent, pref, tail,
+			"tc filter replace dev %s protocol ip parent %s prio %d handle 800::%x u32 match u32 0 0%s",
+			dev, parent, pref, u32NodeID(handle, 0), tail,
 		)}
 	}
+}
+
+// u32NodeID derives a stable u32 filter node id (1..0xfff) for handle 800::NN
+// so `tc filter replace` overwrites the same filter each reconcile.
+func u32NodeID(handle uint32, i int) uint32 {
+	id := (handle + uint32(i)) & 0xfff
+	if id == 0 {
+		id = 1
+	}
+	return id
 }
 
 func ensureHostOrCIDR(v string) string {

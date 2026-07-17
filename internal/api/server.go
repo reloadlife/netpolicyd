@@ -1,11 +1,13 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/reloadlife/netpolicyd/internal/apply"
@@ -20,6 +22,7 @@ type Server struct {
 	Runner  *apply.Runner
 	Token   string
 	Version string
+	applyMu sync.Mutex
 }
 
 func (s *Server) Handler() http.Handler {
@@ -65,11 +68,13 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.Token != "" {
 			h := r.Header.Get("Authorization")
-			if h != "Bearer "+s.Token {
+			expected := "Bearer " + s.Token
+			if subtle.ConstantTimeCompare([]byte(h), []byte(expected)) != 1 {
 				writeErr(w, http.StatusUnauthorized, "unauthorized", "invalid token")
 				return
 			}
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		next(w, r)
 	}
 }
@@ -93,21 +98,21 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 func (s *Server) buildStatus() pkg.Status {
 	ipOK, nftOK, tcOK := apply.Detect()
 	last, at, gen := s.Store.LastApply()
-	pols := s.Store.ListPolicies()
+	c := s.Store.Counts()
 	iptOK := hasBin("iptables") || hasBin("iptables-save")
 	st := pkg.Status{
 		Version:           s.Version,
 		Backend:           string(s.Runner.Backend),
 		IPForward:         s.Store.IPForward(),
-		PolicyCount:       len(pols),
-		RouteCount:        len(s.Store.ListRoutes()),
-		NATCount:          len(s.Store.ListNAT()),
-		ForwardCount:      len(s.Store.ListForwards()),
-		TCCount:           len(s.Store.ListTC()),
-		FirewallCount:     len(s.Store.ListFirewall()),
-		IPAddrCount:       len(s.Store.ListIPAddrs()),
-		IPRuleCount:       len(s.Store.ListIPRules()),
-		LinkCount:         len(s.Store.ListLinks()),
+		PolicyCount:       c.Policies,
+		RouteCount:        c.Routes,
+		NATCount:          c.NAT,
+		ForwardCount:      c.Forwards,
+		TCCount:           c.TC,
+		FirewallCount:     c.Firewall,
+		IPAddrCount:       c.IPAddrs,
+		IPRuleCount:       c.IPRules,
+		LinkCount:         c.Links,
 		LastApplyOK:       last.OK,
 		LastApplyAt:       formatTime(at),
 		LastGeneration:    gen,
@@ -254,7 +259,11 @@ func (s *Server) routes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rt.Enabled = true
-		out := s.Store.UpsertRoute(rt)
+		out, err := s.Store.UpsertRoute(rt)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
 		s.doApply(false)
 		writeJSONStatus(w, http.StatusCreated, out)
 	default:
@@ -293,7 +302,11 @@ func (s *Server) nat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		n.Enabled = true
-		out := s.Store.UpsertNAT(n)
+		out, err := s.Store.UpsertNAT(n)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
 		s.doApply(false)
 		writeJSONStatus(w, http.StatusCreated, out)
 	default:
@@ -332,7 +345,11 @@ func (s *Server) forwards(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.Enabled = true
-		out := s.Store.UpsertForward(f)
+		out, err := s.Store.UpsertForward(f)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
 		s.doApply(false)
 		writeJSONStatus(w, http.StatusCreated, out)
 	default:
@@ -416,38 +433,63 @@ func (s *Server) desired(w http.ResponseWriter, r *http.Request) {
 	if d.Policies != nil {
 		s.Store.ReplacePolicies(d.Policies)
 	}
+	var errs []string
 	for _, rt := range d.Routes {
-		s.Store.UpsertRoute(rt)
+		if _, err := s.Store.UpsertRoute(rt); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	for _, n := range d.NAT {
-		s.Store.UpsertNAT(n)
+		if _, err := s.Store.UpsertNAT(n); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	for _, f := range d.Forwards {
-		s.Store.UpsertForward(f)
+		if _, err := s.Store.UpsertForward(f); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	for _, t := range d.TC {
-		_, _ = s.Store.UpsertTC(t)
+		if _, err := s.Store.UpsertTC(t); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	for _, f := range d.Firewall {
-		_, _ = s.Store.UpsertFirewall(f)
+		if _, err := s.Store.UpsertFirewall(f); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	for _, a := range d.IPAddrs {
-		_, _ = s.Store.UpsertIPAddr(a)
+		if _, err := s.Store.UpsertIPAddr(a); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	for _, r := range d.IPRules {
-		_, _ = s.Store.UpsertIPRule(r)
+		if _, err := s.Store.UpsertIPRule(r); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	for _, l := range d.Links {
-		_, _ = s.Store.UpsertLink(l)
+		if _, err := s.Store.UpsertLink(l); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	for _, sc := range d.Sysctls {
-		_, _ = s.Store.UpsertSysctl(sc)
+		if _, err := s.Store.UpsertSysctl(sc); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	for _, l := range d.IPLists {
-		_, _ = s.Store.UpsertIPList(l)
+		if _, err := s.Store.UpsertIPList(l); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	if d.IPForward != nil {
 		s.Store.SetIPForward(*d.IPForward)
+	}
+	if len(errs) > 0 {
+		writeErr(w, http.StatusBadRequest, "bad_request", strings.Join(errs, "; "))
+		return
 	}
 	res := s.doApply(false)
 	res.Generation = d.Generation
@@ -466,6 +508,8 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) doApply(dry bool) pkg.ApplyResult {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 	res := s.Runner.Apply(s.Store.Snapshot(), dry)
 	if !dry {
 		_, _, gen := s.Store.LastApply()
