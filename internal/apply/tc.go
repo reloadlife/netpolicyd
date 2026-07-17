@@ -98,16 +98,18 @@ func planTC(rules []api.TCSpec) []string {
 
 		// Track minors used on this device to avoid collisions within the plan.
 		used := map[uint32]string{}
+		// One node-id allocator per device: filter identity is scoped to the device.
+		alloc := newU32Alloc()
 		for _, r := range list {
 			minor := allocateTCMinor(r.ID, used)
 			used[minor] = r.ID
-			cmds = append(cmds, planOneTC(dev, r, minor)...)
+			cmds = append(cmds, planOneTC(dev, r, minor, alloc)...)
 		}
 	}
 	return cmds
 }
 
-func planOneTC(dev string, r api.TCSpec, minor uint32) []string {
+func planOneTC(dev string, r api.TCSpec, minor uint32, alloc *u32Alloc) []string {
 	var cmds []string
 	classID := fmt.Sprintf("1:%x", minor)
 	pref := r.Priority
@@ -139,7 +141,7 @@ func planOneTC(dev string, r api.TCSpec, minor uint32) []string {
 			dev, classID, dev, classID, minor,
 		))
 		// Multiple src CIDRs → multiple filters → same HTB class (shared rate pool).
-		cmds = append(cmds, filterCmd(dev, tcRootHandle, pref, minor, r, classID, "")...)
+		cmds = append(cmds, filterCmd(dev, tcRootHandle, pref, r, classID, "", alloc)...)
 	}
 
 	if r.RateRxBps > 0 {
@@ -156,7 +158,7 @@ func planOneTC(dev string, r api.TCSpec, minor uint32) []string {
 			policeIdx = 1
 		}
 		police := fmt.Sprintf("action police index %d rate %s burst %s drop", policeIdx, rate, burst)
-		cmds = append(cmds, filterCmd(dev, tcIngress, rxPref, minor+0x8000, r, "", police)...)
+		cmds = append(cmds, filterCmd(dev, tcIngress, rxPref, r, "", police, alloc)...)
 	}
 	return cmds
 }
@@ -192,8 +194,9 @@ func splitMatchValues(value string) []string {
 //
 // u32 filters carry an explicit stable "handle 800::NN" so `tc filter replace`
 // truly replaces instead of adding a new duplicate every reconcile (unbounded
-// growth). The fw classifier instead takes the mark itself as its handle.
-func filterCmd(dev, parent string, pref int, handle uint32, r api.TCSpec, flowid, police string) []string {
+// growth). Node ids come from alloc, which keeps them unique per (parent, prio)
+// and independent of prio. The fw classifier takes the mark itself as its handle.
+func filterCmd(dev, parent string, pref int, r api.TCSpec, flowid, police string, alloc *u32Alloc) []string {
 	kind := strings.ToLower(strings.TrimSpace(r.MatchKind))
 	value := strings.TrimSpace(r.MatchValue)
 	tail := ""
@@ -228,7 +231,7 @@ func filterCmd(dev, parent string, pref int, handle uint32, r api.TCSpec, flowid
 			if p > 60000 {
 				p = 60000
 			}
-			nodeid := u32NodeID(handle, i)
+			nodeid := alloc.alloc(parent, p, fmt.Sprintf("%s#%d", r.ID, i))
 			out = append(out, fmt.Sprintf(
 				"tc filter replace dev %s protocol ip parent %s prio %d handle 800::%x u32 match ip src %s%s",
 				dev, parent, p, nodeid, ensureHostOrCIDR(v), tail,
@@ -246,7 +249,7 @@ func filterCmd(dev, parent string, pref int, handle uint32, r api.TCSpec, flowid
 			if p > 60000 {
 				p = 60000
 			}
-			nodeid := u32NodeID(handle, i)
+			nodeid := alloc.alloc(parent, p, fmt.Sprintf("%s#%d", r.ID, i))
 			out = append(out, fmt.Sprintf(
 				"tc filter replace dev %s protocol ip parent %s prio %d handle 800::%x u32 match ip dst %s%s",
 				dev, parent, p, nodeid, ensureHostOrCIDR(v), tail,
@@ -256,19 +259,40 @@ func filterCmd(dev, parent string, pref int, handle uint32, r api.TCSpec, flowid
 	default: // any
 		return []string{fmt.Sprintf(
 			"tc filter replace dev %s protocol ip parent %s prio %d handle 800::%x u32 match u32 0 0%s",
-			dev, parent, pref, u32NodeID(handle, 0), tail,
+			dev, parent, pref, alloc.alloc(parent, pref, r.ID+"#0"), tail,
 		)}
 	}
 }
 
-// u32NodeID derives a stable u32 filter node id (1..0xfff) for handle 800::NN
-// so `tc filter replace` overwrites the same filter each reconcile.
-func u32NodeID(handle uint32, i int) uint32 {
-	id := (handle + uint32(i)) & 0xfff
-	if id == 0 {
-		id = 1
+// u32Alloc hands out u32 filter node ids for `handle 800::NN`.
+//
+// A filter's kernel identity is (dev, parent, protocol, prio) + node id. Node
+// ids MUST NOT be derived from the same value as prio: deriving both from
+// minor+i made them perfectly correlated, so rule A's i-th filter aliased rule
+// B's 0th whenever their minors were adjacent (reachable with default
+// priorities) and `replace` silently gave A's CIDR B's rate limit.
+//
+// Node ids are seeded from the rule ID + CIDR index — independent of prio — and
+// probed against the ids already used at the same (parent, prio). Deterministic
+// for a given rule set, so repeated reconciles replace the same filter.
+type u32Alloc struct{ used map[string]bool }
+
+func newU32Alloc() *u32Alloc { return &u32Alloc{used: map[string]bool{}} }
+
+func (a *u32Alloc) alloc(parent string, prio int, seed string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(seed))
+	base := h.Sum32()
+	const span = 0xfff // node ids 1..0xfff
+	for k := uint32(0); k < span; k++ {
+		id := 1 + (base+k)%span
+		key := fmt.Sprintf("%s|%d|%d", parent, prio, id)
+		if !a.used[key] {
+			a.used[key] = true
+			return id
+		}
 	}
-	return id
+	return 1
 }
 
 func ensureHostOrCIDR(v string) string {

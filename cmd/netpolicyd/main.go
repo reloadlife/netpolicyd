@@ -76,17 +76,24 @@ func main() {
 	}
 }
 
-// isLoopback reports whether addr's host is a loopback/localhost address.
+// isLoopback reports whether addr binds ONLY to a loopback address.
+//
+// An empty host (":51910") binds every interface, so it is NOT loopback —
+// treating it as loopback would let the fail-closed token check be bypassed
+// on the most common wide-open listen form. Unparseable hosts fail closed too.
 func isLoopback(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 	}
-	switch host {
-	case "127.0.0.1", "::1", "localhost", "":
+	if host == "" {
+		return false // ":port" = all interfaces
+	}
+	if host == "localhost" {
 		return true
 	}
-	return false
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func logRequest(next http.Handler) http.Handler {

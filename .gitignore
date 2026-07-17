@@ -24,3 +24,6 @@ coverage.html
 
 # Go
 vendor/
+
+# local agent worktrees
+.claude/

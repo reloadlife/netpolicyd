@@ -71,6 +71,27 @@ func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.Fo
 	// In mock, plan both so dry-run shows full intent.
 	mock := !nftOK && !iptOK
 
+	// Does any rule actually target the iptables backend? ("auto" picks nft
+	// whenever nft exists, so on an nft host this is normally false.)
+	needIPT := false
+	for _, r := range all {
+		if !r.Enabled {
+			continue
+		}
+		be := strings.ToLower(r.Backend)
+		if be == "" || be == "auto" {
+			if nftOK || mock {
+				be = "nft"
+			} else {
+				be = "iptables"
+			}
+		}
+		if be == "iptables" {
+			needIPT = true
+			break
+		}
+	}
+
 	var cmds []string
 	// Always ensure+flush managed chains whenever the backend is usable, even
 	// when no rule currently targets it — deleting the last nft/iptables rule
@@ -79,8 +100,15 @@ func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.Fo
 		cmds = append(cmds, ensureNFTBase()...)
 		cmds = append(cmds, flushNFTChains()...)
 	}
-	if iptOK || mock {
+	switch {
+	case needIPT || mock:
+		// Rules to place: create chains + jumps, then they get flushed/refilled.
 		cmds = append(cmds, ensureIptablesBase()...)
+	case iptOK:
+		// No iptables-backed rules, but stale ones may be live from a previous
+		// generation. Flush them — without creating chains/jumps and without
+		// paying ~32 execs per apply on hosts that never used this backend.
+		cmds = append(cmds, flushIptablesChains()...)
 	}
 
 	// Track emitted command lines to avoid identical adds in one plan.
@@ -216,6 +244,25 @@ func flushNFTChains() []string {
 		cmds = append(cmds, fmt.Sprintf("nft flush chain inet netpolicyd %s 2>/dev/null || true", ch))
 	}
 	return cmds
+}
+
+// flushIptablesChains clears managed iptables chains WITHOUT creating them.
+//
+// Guarded by one existence check in a single sh -c: a host with no managed
+// iptables chains pays one exec, not the ~32 that unconditionally running
+// ensureIptablesBase would cost on every apply (apply runs on every write).
+func flushIptablesChains() []string {
+	return []string{
+		`iptables -t filter -L NETPOLICYD_FWD -n >/dev/null 2>&1 && { ` +
+			`iptables -t filter -F NETPOLICYD_IN 2>/dev/null; ` +
+			`iptables -t filter -F NETPOLICYD_FWD 2>/dev/null; ` +
+			`iptables -t filter -F NETPOLICYD_OUT 2>/dev/null; ` +
+			`iptables -t nat -F NETPOLICYD_PRE 2>/dev/null; ` +
+			`iptables -t nat -F NETPOLICYD_POST 2>/dev/null; ` +
+			`iptables -t mangle -F NETPOLICYD_PRE 2>/dev/null; ` +
+			`iptables -t mangle -F NETPOLICYD_POST 2>/dev/null; ` +
+			`iptables -t mangle -F NETPOLICYD_FWD 2>/dev/null; } || true`,
+	}
 }
 
 // ensureIptablesBase creates/flushes dedicated NETPOLICYD jump chains so
@@ -445,9 +492,10 @@ func iptablesCmd(r api.FirewallRule) string {
 		args = append(args, "-j", "LOG")
 		pref := r.LogPrefix
 		if pref == "" {
-			pref = "netpolicyd: "
+			pref = "netpolicyd"
 		}
-		args = append(args, "--log-prefix", pref)
+		// --log-prefix is Join'd into the sh -c line: one safe token, no spaces
+		args = append(args, "--log-prefix", sanitizeToken(pref))
 	default:
 		args = append(args, "-j", strings.ToUpper(act))
 	}
@@ -459,14 +507,8 @@ func iptablesCmd(r api.FirewallRule) string {
 		cmt = r.ID
 	}
 	if cmt != "" {
-		// sanitize comment for iptables
-		cmt = strings.Map(func(rr rune) rune {
-			if rr == '"' || rr == '\'' || rr == '`' || rr == '\n' {
-				return '-'
-			}
-			return rr
-		}, cmt)
-		args = append(args, "-m", "comment", "--comment", "netpolicyd:"+cmt)
+		// same sh -c sink as nft — whitelist, never a denylist
+		args = append(args, "-m", "comment", "--comment", "netpolicyd:"+sanitizeToken(cmt))
 	}
 	return strings.Join(args, " ")
 }

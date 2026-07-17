@@ -44,6 +44,29 @@ func TestValidationRejectsInjection(t *testing.T) {
 	}
 }
 
+// Regression: validation must not reject symbolic sysctl values. `fq` and `bbr`
+// are the two most common sysctls on a shaping/gateway box and both worked
+// before validation existed; an integer-only rule was a real regression.
+func TestValidationAcceptsSymbolicSysctls(t *testing.T) {
+	m := New()
+	for _, c := range []struct{ k, v string }{
+		{"net.core.default_qdisc", "fq"},
+		{"net.ipv4.tcp_congestion_control", "bbr"},
+		{"net.ipv4.ip_forward", "1"},
+		{"net.ipv4.conf.all.rp_filter", "0"},
+	} {
+		if _, err := m.UpsertSysctl(api.SysctlSpec{Key: c.k, Value: c.v}); err != nil {
+			t.Errorf("legit sysctl %s=%s rejected: %v", c.k, c.v, err)
+		}
+	}
+	// A value with a space or metachar still reaches `sh -c` unquoted — reject.
+	for _, bad := range []string{"1; touch /tmp/pwn", "4096 87380 6291456", "fq$(id)"} {
+		if _, err := m.UpsertSysctl(api.SysctlSpec{Key: "net.core.default_qdisc", Value: bad}); err == nil {
+			t.Errorf("unsafe sysctl value accepted: %q", bad)
+		}
+	}
+}
+
 func TestValidationAcceptsLegit(t *testing.T) {
 	m := New()
 	cases := []func() error{

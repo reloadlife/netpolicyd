@@ -26,8 +26,11 @@ var (
 	reTable   = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,32}$`)
 	reCtState = regexp.MustCompile(`^[A-Za-z,]{1,64}$`)
 	reToAddr  = regexp.MustCompile(`^[0-9A-Fa-f:.\[\]/-]{1,48}(:[0-9]{1,5})?$`)
-	reSysVal  = regexp.MustCompile(`^-?[0-9]{1,20}$`)
-	reMark    = regexp.MustCompile(`^(0[xX][0-9A-Fa-f]{1,8}|[0-9]{1,10})(/(0[xX][0-9A-Fa-f]{1,8}|[0-9]{1,10}))?$`)
+	// Integers plus the symbolic values real sysctls take (net.core.default_qdisc=fq,
+	// net.ipv4.tcp_congestion_control=bbr). No spaces: apply.go emits an unquoted
+	// `sysctl -w k=v`, so a multi-value sysctl silently corrupts to its first element.
+	reSysVal = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+	reMark   = regexp.MustCompile(`^(0[xX][0-9A-Fa-f]{1,8}|[0-9]{1,10})(/(0[xX][0-9A-Fa-f]{1,8}|[0-9]{1,10}))?$`)
 )
 
 // validIface checks a network device name (also accepts empty when allowed).
@@ -203,7 +206,7 @@ func validateSysctl(s api.SysctlSpec) error {
 		return fmt.Errorf("invalid sysctl key %q", s.Key)
 	}
 	if s.Value != "" && !reSysVal.MatchString(strings.TrimSpace(s.Value)) {
-		return fmt.Errorf("invalid sysctl value %q (single integer only)", s.Value)
+		return fmt.Errorf("invalid sysctl value %q (single token, no spaces)", s.Value)
 	}
 	return nil
 }

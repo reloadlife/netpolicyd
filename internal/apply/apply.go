@@ -371,23 +371,24 @@ func natCoverKey(src, list, oif string) string {
 	return normalizeCIDR(src) + "|" + list + "|" + oif
 }
 
-// nftComment returns a shell-safe double-quoted comment without nft-breaking chars.
-// Spaces are collapsed to '-' so sh -c + nft never split the comment token.
-func nftComment(s string) string {
+// sanitizeToken reduces free-form text to a single shell- and nft-safe token.
+//
+// Whitelist, not denylist: these strings are Join'd into a command line that is
+// handed to `sh -c`, so ANY character outside [A-Za-z0-9_.-] becomes '-'. The
+// previous denylist let `, |, & and $ through — a root command-injection sink
+// reachable from the user-supplied comment / log-prefix fields.
+func sanitizeToken(s string) string {
 	if s == "" {
 		s = "netpolicyd"
 	}
 	s = strings.Map(func(r rune) rune {
-		switch r {
-		case '"', '\\', ':', ';', '{', '}', '\n', '\r', ' ', '\t',
-			'→', '←', '—', '–', '/', '(', ')', '[', ']', '<', '>', '=':
-			return '-'
-		default:
-			// nft comments: keep ASCII alnum + limited punctuation only
-			if r < 32 || r > 126 {
-				return '-'
-			}
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
 			return r
+		case r == '_', r == '.', r == '-':
+			return r
+		default:
+			return '-'
 		}
 	}, s)
 	// collapse runs of '-'
@@ -398,5 +399,10 @@ func nftComment(s string) string {
 	if s == "" {
 		s = "netpolicyd"
 	}
-	return `"` + s + `"`
+	return s
+}
+
+// nftComment returns a shell-safe double-quoted comment for nft.
+func nftComment(s string) string {
+	return `"` + sanitizeToken(s) + `"`
 }
