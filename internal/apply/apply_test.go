@@ -1,6 +1,7 @@
 package apply
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -31,6 +32,33 @@ func TestAutoMasqSkippedWhenExplicitNATExists(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("want 1 masq, got %d\n%s", n, strings.Join(cmds, "\n"))
+	}
+}
+
+func TestDeviceRequiredByCmd(t *testing.T) {
+	cases := map[string]string{
+		`ip route replace default dev gre-lab table 100`: "gre-lab",
+		`tc qdisc replace dev gre-lab root handle 1: htb default 1`: "gre-lab",
+		`tc filter replace dev wg0 protocol ip parent 1: prio 1 handle 1: u32 match ip src 10.8.0.1/32 flowid 1:10`: "wg0",
+		`sysctl -w net.ipv4.ip_forward=1`: "",
+		`mkdir -p /etc/iproute2`: "",
+		`ip link set gre-lab up`: "gre-lab",
+	}
+	for cmd, want := range cases {
+		got := deviceRequiredByCmd(cmd)
+		if got != want {
+			t.Fatalf("cmd %q: got %q want %q", cmd, got, want)
+		}
+	}
+}
+
+func TestMissingDeviceErr(t *testing.T) {
+	dev, ok := missingDeviceErr(fmt.Errorf(`exit status 1: Cannot find device "gre-lab"`))
+	if !ok || dev != "gre-lab" {
+		t.Fatalf("got %q ok=%v", dev, ok)
+	}
+	if _, ok := missingDeviceErr(fmt.Errorf("permission denied")); ok {
+		t.Fatal("expected false")
 	}
 }
 

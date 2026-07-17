@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"github.com/reloadlife/netpolicyd/pkg/api"
@@ -244,18 +245,40 @@ func (r *Runner) Apply(s api.ApplyState, dryRun bool) api.ApplyResult {
 		}
 		return res
 	}
+	missingDevs := map[string]bool{}
 	for _, c := range cmds {
+		// Skip ip/tc against netdevs that are not present (stale gre-lab, mock WG, …)
+		// so a missing egress does not spam hard errors every reconcile.
+		if dev := deviceRequiredByCmd(c); dev != "" && !linkExists(dev) {
+			missingDevs[dev] = true
+			res.Skipped++
+			continue
+		}
 		if err := runShell(c); err != nil {
+			if dev, ok := missingDeviceErr(err); ok {
+				missingDevs[dev] = true
+				res.Skipped++
+				continue
+			}
 			res.OK = false
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", c, err))
 			continue
 		}
 		res.Applied++
 	}
-	if res.OK {
-		res.Message = fmt.Sprintf("applied %d commands", res.Applied)
-	} else {
+	switch {
+	case !res.OK:
 		res.Message = fmt.Sprintf("applied %d with %d errors", res.Applied, len(res.Errors))
+	case len(missingDevs) > 0:
+		devs := make([]string, 0, len(missingDevs))
+		for d := range missingDevs {
+			devs = append(devs, d)
+		}
+		sort.Strings(devs)
+		res.Message = fmt.Sprintf("applied %d, skipped %d (missing device: %s)",
+			res.Applied, res.Skipped, strings.Join(devs, ", "))
+	default:
+		res.Message = fmt.Sprintf("applied %d commands", res.Applied)
 	}
 	return res
 }
@@ -271,22 +294,107 @@ func runShell(cmdline string) error {
 	return nil
 }
 
+// linkExists reports whether a netdev is present under /sys/class/net.
+func linkExists(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.ContainsAny(name, "/ \t") {
+		return false
+	}
+	st, err := os.Stat("/sys/class/net/" + name)
+	return err == nil && st.IsDir()
+}
+
+// deviceRequiredByCmd extracts a single netdev from ip/tc commands that need it present.
+// Returns "" for commands that do not target a specific interface.
+func deviceRequiredByCmd(cmdline string) string {
+	fields := strings.Fields(cmdline)
+	if len(fields) < 3 {
+		return ""
+	}
+	// tc … dev NAME …
+	if fields[0] == "tc" {
+		for i := 1; i < len(fields)-1; i++ {
+			if fields[i] == "dev" {
+				return fields[i+1]
+			}
+		}
+		return ""
+	}
+	// ip route … dev NAME …
+	// ip addr … dev NAME …
+	// ip link set NAME …
+	if fields[0] == "ip" {
+		for i := 1; i < len(fields)-1; i++ {
+			if fields[i] == "dev" {
+				return fields[i+1]
+			}
+		}
+		if len(fields) >= 4 && fields[1] == "link" && fields[2] == "set" {
+			// ip link set gre-lab up / mtu …
+			name := fields[3]
+			if name != "dev" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// missingDeviceErr detects "Cannot find device \"X\"" from ip/tc.
+func missingDeviceErr(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	s := err.Error()
+	const marker = "Cannot find device "
+	i := strings.Index(s, marker)
+	if i < 0 {
+		return "", false
+	}
+	rest := s[i+len(marker):]
+	rest = strings.TrimSpace(rest)
+	rest = strings.Trim(rest, `"'`)
+	// take first token
+	if j := strings.IndexAny(rest, " \n\t:"); j >= 0 {
+		rest = rest[:j]
+	}
+	rest = strings.Trim(rest, `"'`)
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
+}
+
 func natCoverKey(src, list, oif string) string {
 	return normalizeCIDR(src) + "|" + list + "|" + oif
 }
 
 // nftComment returns a shell-safe double-quoted comment without nft-breaking chars.
+// Spaces are collapsed to '-' so sh -c + nft never split the comment token.
 func nftComment(s string) string {
 	if s == "" {
 		s = "netpolicyd"
 	}
 	s = strings.Map(func(r rune) rune {
 		switch r {
-		case '"', '\\', ':', ';', '{', '}', '\n', '\r':
+		case '"', '\\', ':', ';', '{', '}', '\n', '\r', ' ', '\t',
+			'→', '←', '—', '–', '/', '(', ')', '[', ']', '<', '>', '=':
 			return '-'
 		default:
+			// nft comments: keep ASCII alnum + limited punctuation only
+			if r < 32 || r > 126 {
+				return '-'
+			}
 			return r
 		}
 	}, s)
+	// collapse runs of '-'
+	for strings.Contains(s, "--") {
+		s = strings.ReplaceAll(s, "--", "-")
+	}
+	s = strings.Trim(s, "-")
+	if s == "" {
+		s = "netpolicyd"
+	}
 	return `"` + s + `"`
 }

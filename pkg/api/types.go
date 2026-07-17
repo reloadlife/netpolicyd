@@ -146,6 +146,10 @@ type IPList struct {
 // Example: cap client 10.77.0.4 on gre-lab to 50 Mbit TX / 20 Mbit RX:
 //
 //	{device:"gre-lab", rate_tx_bps:50e6, rate_rx_bps:20e6, match_kind:"src_cidr", match_value:"10.77.0.4/32"}
+//
+// Account-shared pool (all device VIPs share one HTB class + one police):
+//
+//	match_kind:"src_cidr", match_value:"100.67.80.2/32,100.67.80.3/32"
 type TCSpec struct {
 	ID      string `json:"id"`
 	Name    string `json:"name,omitempty"`
@@ -160,8 +164,10 @@ type TCSpec struct {
 	CeilingTxBps int64 `json:"ceiling_tx_bps,omitempty"`
 	// MatchKind: any | src_cidr | dst_cidr | fwmark
 	//   any       — all traffic on Device (default class only if no other match)
-	//   src_cidr  — match source CIDR (typical client tunnel IP)
-	//   dst_cidr  — match destination CIDR
+	//   src_cidr  — match source CIDR (typical client tunnel IP).
+	//               MatchValue may be a comma/space-separated list of CIDRs;
+	//               all share one HTB class and one police index (account pool).
+	//   dst_cidr  — match destination CIDR (also multi-value capable)
 	//   fwmark    — match skb mark (decimal or 0xhex in MatchValue)
 	MatchKind  string `json:"match_kind"`
 	MatchValue string `json:"match_value,omitempty"`
