@@ -74,24 +74,49 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 		cmds = append(cmds, planIPAddrs(s.IPAddrs)...)
 	}
 
-	// Ensure netpolicyd routing tables exist for each unique egress
-	tableOf := map[string]int{}
-	next := r.TableBase
+	// Ensure netpolicyd routing tables exist for each unique egress.
+	//
+	// Table ids are assigned over SORTED egress names, not in policy iteration
+	// order. Policy order is not stable between applies (the control plane
+	// builds per-device egress policies from a map), and an unstable assignment
+	// is a correctness bug, not a cosmetic one:
+	//
+	//   - `ip rule del from X table N` before the add only matches if N is the
+	//     same N as last time. When it drifts, the old rule survives and a new
+	//     one is added beside it, so rules accumulate without bound.
+	//   - Worse, those siblings point at DIFFERENT egresses. On thr-respina one
+	//     VIP ended up with rules for tables 100, 101, 102 and 103
+	//     simultaneously; whichever sorts first wins, so a device silently
+	//     exits through a tunnel nobody selected.
+	//
+	// Sorting makes zur0 the same table id on every apply, on every node.
+	egressNames := make([]string, 0, 8)
+	seenEgress := map[string]bool{}
 	for _, p := range s.Policies {
 		if !p.Enabled || p.Action != api.ActionEgress || p.EgressName == "" {
 			continue
 		}
-		if _, ok := tableOf[p.EgressName]; ok {
+		if seenEgress[p.EgressName] {
 			continue
 		}
-		tableOf[p.EgressName] = next
+		seenEgress[p.EgressName] = true
+		egressNames = append(egressNames, p.EgressName)
+	}
+	sort.Strings(egressNames)
+
+	tableOf := map[string]int{}
+	for i, name := range egressNames {
+		tid := r.TableBase + i
+		tableOf[name] = tid
 		cmds = append(cmds, "mkdir -p /etc/iproute2 && touch /etc/iproute2/rt_tables")
+		// Rewrite rather than skip-if-present: a stale line mapping this name to
+		// a different id makes `ip rule show` and rt_tables disagree, which is
+		// how the numbers above became impossible to read off the host.
 		cmds = append(cmds, fmt.Sprintf(
-			"grep -q 'netpolicyd-%s' /etc/iproute2/rt_tables 2>/dev/null || echo '%d netpolicyd-%s' >> /etc/iproute2/rt_tables",
-			p.EgressName, next, p.EgressName))
+			"sed -i '/[[:space:]]netpolicyd-%s$/d' /etc/iproute2/rt_tables 2>/dev/null; echo '%d netpolicyd-%s' >> /etc/iproute2/rt_tables",
+			name, tid, name))
 		cmds = append(cmds, fmt.Sprintf(
-			"ip route replace default dev %s table %d", p.EgressName, next))
-		next++
+			"ip route replace default dev %s table %d", name, tid))
 	}
 
 	// Explicit routes
@@ -265,7 +290,17 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 	// desired and never removes rules for what left. A deleted device kept its
 	// `ip rule` forever, so re-issuing that VIP to a new device silently handed
 	// the new device the old one's egress.
-	if hasBin("ip") || r.Backend == BackendMock {
+	//
+	// Never prune on an empty keep-list. Right after a restart, desired state is
+	// empty until the control plane pushes — and an empty keep-list means "I do
+	// not know what should exist yet", not "nothing should exist". Pruning there
+	// deletes every managed rule on the host; that is exactly what happened on
+	// thr-respina, taking all 17 devices' egress with it.
+	//
+	// The cost of this guard is that removing the very last egress policy leaves
+	// its rule behind until another one exists. That is strictly better than a
+	// restart race emptying the fleet.
+	if (hasBin("ip") || r.Backend == BackendMock) && len(keepIPRule) > 0 {
 		cmds = append(cmds, pruneIPRules(keepIPRule))
 	}
 
@@ -325,7 +360,13 @@ func pruneIPRules(keep map[string]bool) string {
 			`sed -n 's/^\([0-9]\{1,\}\):[[:space:]]*from \([^ ]\{1,\}\) .*$/\1 \2/p' | `+
 			`while read -r npd_prio npd_from; do `+
 			`[ "$npd_prio" -ge %d ] && [ "$npd_prio" -le %d ] || continue; `+
-			`case " $npd_keep " in *" $npd_from@$npd_prio "*) continue;; esac; `+
+			`[ "$npd_from" = all ] && continue; `+
+			// `ip rule show` prints a host selector WITHOUT its prefix length
+			// ("from 10.0.0.1", never "from 10.0.0.1/32") while the keep-list is
+			// normalized. Without this the two never match and the prune deletes
+			// every managed rule on the host — which is exactly what it did.
+			`npd_key="$npd_from"; case "$npd_key" in */*) ;; *:*) npd_key="$npd_key/128";; *) npd_key="$npd_key/32";; esac; `+
+			`case " $npd_keep " in *" $npd_key@$npd_prio "*) continue;; esac; `+
 			`ip rule del from "$npd_from" priority "$npd_prio" 2>/dev/null || true; `+
 			`done`,
 		shellQuote(strings.Join(want, " ")), managedIPRulePrioMin, managedIPRulePrioMax)
