@@ -200,8 +200,19 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 			}
 			if src != "" {
 				prio := 10000 + p.Priority
+				// Delete by (selector, priority) — NOT by table.
+				//
+				// Deleting by table only removes a rule that already points at the
+				// table we are about to install, so changing a device's egress left
+				// the OLD rule in place and added the new one beside it. Both sit at
+				// the same priority and first match wins, so the device kept exiting
+				// through its previous tunnel while the UI, the database and the
+				// policy all agreed it had moved. Caught live: iPhone set to
+				// resid-zur, still egressing via resid-chi.
+				//
+				// Looped because more than one stale duplicate may already exist.
 				cmds = append(cmds, fmt.Sprintf(
-					"ip rule del from %s table %d 2>/dev/null || true", src, tid))
+					"while ip rule del from %s priority %d 2>/dev/null; do :; done; true", src, prio))
 				cmds = append(cmds, fmt.Sprintf(
 					"ip rule add from %s table %d priority %d", src, tid, prio))
 				keepIPRule[ipRuleKey(src, prio)] = true

@@ -233,3 +233,29 @@ func TestEgressTableIDsSurviveSetChanges(t *testing.T) {
 		}
 	}
 }
+
+// Switching a device's egress must remove the old rule, not add a second one
+// beside it. Deleting by (selector, table) only matched a rule already pointing
+// at the new table, so the previous rule survived at the same priority and won
+// on first match — the device kept using its old tunnel while the database,
+// the policy and the UI all said it had moved.
+func TestEgressSwitchDeletesOldRuleBySelectorAndPriority(t *testing.T) {
+	mk := func(egress string) api.ApplyState {
+		return api.ApplyState{Policies: []api.PolicyRule{{
+			ID: "d1", Enabled: true, Priority: 5, Action: api.ActionEgress,
+			EgressName: egress, SourceCIDR: "100.67.80.15/32",
+		}}}
+	}
+	r := &Runner{Backend: BackendMock, TableBase: 100}
+	for _, eg := range []string{"resid-chi", "resid-zur"} {
+		joined := strings.Join(r.Plan(mk(eg)), "\n")
+		// The delete must not name a table, or it cannot remove a rule pointing
+		// somewhere else.
+		if strings.Contains(joined, "ip rule del from 100.67.80.15/32 table") {
+			t.Errorf("[%s] delete is scoped to a table, so an egress switch leaks the old rule:\n%s", eg, joined)
+		}
+		if !strings.Contains(joined, "ip rule del from 100.67.80.15/32 priority 10005") {
+			t.Errorf("[%s] no delete by selector+priority:\n%s", eg, joined)
+		}
+	}
+}
