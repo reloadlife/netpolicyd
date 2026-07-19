@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/reloadlife/netpolicyd/pkg/api"
@@ -104,9 +105,35 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 	}
 	sort.Strings(egressNames)
 
+	// Sorting alone is not enough. The set only contains egresses some device
+	// currently selects, so one device switching tunnels changes the set and
+	// reshuffles every id below it — orphaning every existing rule, because
+	// `ip rule del ... table N` still names the old N. Observed as duplicate
+	// rules for one VIP pointing at both zur0 and de0.
+	//
+	// /etc/iproute2/rt_tables is the registry: an egress keeps whatever id it
+	// was first given, for as long as that line exists. New names take the next
+	// free id. This is stable across set changes, restarts, and reorderings.
+	existing := readRTTableIDs()
+	usedID := map[int]bool{}
+	for _, id := range existing {
+		usedID[id] = true
+	}
+	nextFree := r.TableBase
+	allocate := func() int {
+		for usedID[nextFree] {
+			nextFree++
+		}
+		usedID[nextFree] = true
+		return nextFree
+	}
+
 	tableOf := map[string]int{}
-	for i, name := range egressNames {
-		tid := r.TableBase + i
+	for _, name := range egressNames {
+		tid, ok := existing[name]
+		if !ok {
+			tid = allocate()
+		}
 		tableOf[name] = tid
 		cmds = append(cmds, "mkdir -p /etc/iproute2 && touch /etc/iproute2/rt_tables")
 		// Rewrite rather than skip-if-present: a stale line mapping this name to
@@ -313,6 +340,36 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 	}
 
 	return cmds
+}
+
+// rtTablesPath is where iproute2 keeps the table id -> name registry.
+var rtTablesPath = "/etc/iproute2/rt_tables"
+
+// readRTTableIDs returns the table id already assigned to each netpolicyd-managed
+// egress, so an egress keeps its id for as long as the line survives. Missing or
+// unreadable file yields an empty map, which just means everything is allocated
+// fresh — correct on a first run.
+func readRTTableIDs() map[string]int {
+	out := map[string]int{}
+	raw, err := os.ReadFile(rtTablesPath)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		f := strings.Fields(line)
+		if len(f) != 2 || !strings.HasPrefix(f[1], "netpolicyd-") {
+			continue
+		}
+		id, err := strconv.Atoi(f[0])
+		if err != nil {
+			continue
+		}
+		out[strings.TrimPrefix(f[1], "netpolicyd-")] = id
+	}
+	return out
 }
 
 // policySourceCIDR is the client source a policy applies to: the explicit

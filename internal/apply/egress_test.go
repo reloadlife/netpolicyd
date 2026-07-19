@@ -178,3 +178,58 @@ func TestEgressTableIDsAreOrderIndependent(t *testing.T) {
 		}
 	}
 }
+
+// An egress must keep its table id when the set of selected egresses changes.
+// Sorting alone was not enough: the set only holds egresses some device
+// currently selects, so one device switching tunnels reshuffled every id below
+// it and orphaned every existing rule — leaving one VIP with rules for two
+// different egresses at once.
+func TestEgressTableIDsSurviveSetChanges(t *testing.T) {
+	dir := t.TempDir()
+	rt := filepath.Join(dir, "rt_tables")
+	if err := os.WriteFile(rt, []byte(
+		"# reserved\n255\tlocal\n100\tnetpolicyd-bulg0\n101\tnetpolicyd-de0\n103\tnetpolicyd-zur0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := rtTablesPath
+	rtTablesPath = rt
+	defer func() { rtTablesPath = old }()
+
+	mk := func(names ...string) api.ApplyState {
+		s := api.ApplyState{}
+		for i, n := range names {
+			s.Policies = append(s.Policies, api.PolicyRule{
+				ID: "p" + n, Enabled: true, Priority: 5, Action: api.ActionEgress,
+				EgressName: n, SourceCIDR: fmt.Sprintf("10.0.0.%d/32", i+1),
+			})
+		}
+		return s
+	}
+	r := &Runner{Backend: BackendMock, TableBase: 100}
+	tableFor := func(cmds []string, egress string) string {
+		for _, c := range cmds {
+			if strings.HasPrefix(c, "ip route replace default dev "+egress+" table ") {
+				return c[strings.LastIndex(c, " ")+1:]
+			}
+		}
+		return ""
+	}
+
+	// zur0 is registered as 103 and must stay 103 no matter what else appears.
+	for _, set := range [][]string{
+		{"zur0"},
+		{"bulg0", "de0", "zur0"},
+		{"de0", "ist0", "resid-chi", "resid-zur", "zur0"}, // new names appear
+	} {
+		if got := tableFor(r.Plan(mk(set...)), "zur0"); got != "103" {
+			t.Errorf("zur0 got table %q with set %v, want 103 from rt_tables", got, set)
+		}
+	}
+	// A brand-new egress must not steal an id already registered.
+	got := tableFor(r.Plan(mk("ist0", "zur0")), "ist0")
+	for _, taken := range []string{"100", "101", "103"} {
+		if got == taken {
+			t.Errorf("new egress ist0 took already-registered id %s", got)
+		}
+	}
+}
