@@ -25,21 +25,21 @@ func TestPlanFirewallNFT(t *testing.T) {
 	}
 }
 
-func TestPlanFirewallIptables(t *testing.T) {
+// The iptables backend is gone; nft is the only one. A rule that still asks
+// for Backend "iptables" must be emitted as nft rather than silently dropped —
+// a firewall rule that vanishes is worse than one expressed in another syntax.
+func TestIptablesBackedRuleStillEmittedAsNFT(t *testing.T) {
 	cmds := planFirewall([]api.FirewallRule{{
 		ID: "fw2", Enabled: true, Backend: "iptables",
 		Table: "filter", Chain: "forward", Source: "10.0.0.0/8",
 		OutIface: "ens18", Action: "accept",
 	}}, nil, nil, nil)
 	joined := strings.Join(cmds, "\n")
-	if !strings.Contains(joined, "-A NETPOLICYD_FWD") {
-		t.Fatalf("missing iptables managed chain:\n%s", joined)
+	if strings.Contains(joined, "NETPOLICYD_FWD") || strings.Contains(joined, "-A ") {
+		t.Fatalf("still emitting iptables:\n%s", joined)
 	}
-	if !strings.Contains(joined, "-s 10.0.0.0/8") {
-		t.Fatalf("missing source:\n%s", joined)
-	}
-	if !strings.Contains(joined, "NETPOLICYD_FWD") {
-		t.Fatalf("expected NETPOLICYD_FWD:\n%s", joined)
+	if !strings.Contains(joined, "ip saddr 10.0.0.0/8") {
+		t.Fatalf("rule was dropped instead of translated:\n%s", joined)
 	}
 }
 
@@ -153,15 +153,17 @@ func TestDedupeNATAndRules(t *testing.T) {
 	}
 }
 
-func TestIptablesUsesManagedChain(t *testing.T) {
-	c := iptablesCmd(api.FirewallRule{
+// Nothing may touch iptables any more, including the built-in chains the old
+// backend was careful to avoid.
+func TestNoIptablesCommandsEmitted(t *testing.T) {
+	cmds := planFirewall([]api.FirewallRule{{
+		ID: "m", Enabled: true, Backend: "iptables",
 		Table: "nat", Chain: "postrouting", Action: "masquerade",
-		Source: "10.0.0.0/8", OutIface: "ens18", Backend: "iptables",
-	})
-	if !strings.Contains(c, "NETPOLICYD_POST") {
-		t.Fatal(c)
-	}
-	if strings.Contains(c, "-A POSTROUTING") {
-		t.Fatalf("should not append to built-in: %s", c)
+		Source: "10.0.0.0/8", OutIface: "ens18",
+	}}, nil, nil, nil)
+	for _, c := range cmds {
+		if strings.HasPrefix(c, "iptables") || strings.Contains(c, "NETPOLICYD_") {
+			t.Errorf("iptables command survived: %s", c)
+		}
 	}
 }

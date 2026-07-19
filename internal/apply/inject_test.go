@@ -33,7 +33,7 @@ func TestCommentIsNotAnInjectionSink(t *testing.T) {
 		}
 		for _, line := range []string{
 			nftRuleCmd(api.FirewallRule{Chain: "forward", Action: "drop", Enabled: true, Comment: p, Backend: "nft"}),
-			iptablesCmd(api.FirewallRule{Chain: "forward", Action: "log", Enabled: true, LogPrefix: p, Comment: p, Backend: "iptables"}),
+			nftRuleCmd(api.FirewallRule{Chain: "forward", Action: "log", Enabled: true, LogPrefix: p, Comment: p, Backend: "nft"}),
 		} {
 			if strings.ContainsAny(line, "`|&$;") {
 				t.Errorf("injection reached emitted command: %q -> %s", p, line)

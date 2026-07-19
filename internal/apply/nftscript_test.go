@@ -118,3 +118,31 @@ func firstLines(s string, n int) string {
 	}
 	return strings.Join(parts, "\n")
 }
+
+// nft rejects a bare `dnat to <addr>` inside an inet table: it wants
+// `dnat ip to`. Because the managed table is applied as ONE transaction, a
+// single rule like this rejects the entire ruleset — on het it silently blocked
+// every other rule from updating and left a stale generation resident, looking
+// healthy from the outside.
+func TestNATRulesCarryFamilyQualifier(t *testing.T) {
+	cases := []struct{ action, addr, want string }{
+		{"dnat", "10.66.0.1:2456", "dnat ip to 10.66.0.1:2456"},
+		{"snat", "10.0.0.1", "snat ip to 10.0.0.1"},
+		{"dnat", "[2001:db8::1]:443", "dnat ip6 to [2001:db8::1]:443"},
+		{"snat", "2001:db8::1", "snat ip6 to 2001:db8::1"},
+	}
+	for _, tc := range cases {
+		r := api.FirewallRule{
+			Enabled: true, Backend: "nft", Table: "nat", Chain: "prerouting",
+			Action: tc.action, Protocol: "udp", Dport: "2456",
+		}
+		if tc.action == "dnat" {
+			r.ToDestination = tc.addr
+		} else {
+			r.ToSource = tc.addr
+		}
+		if got := nftRuleBody(r); !strings.Contains(got, tc.want) {
+			t.Errorf("%s %s -> %q, want it to contain %q", tc.action, tc.addr, got, tc.want)
+		}
+	}
+}

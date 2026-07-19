@@ -19,10 +19,7 @@ func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.Fo
 	// On an nft host, list references compile to set references — do NOT expand
 	// them into a rule per entry. Expansion is only for the iptables backend,
 	// which has no equivalent of a named set.
-	nftOK := hasBin("nft")
-	if !nftOK {
-		rules = expandFirewallLists(rules, lists)
-	}
+	// Lists compile to named nft sets, so they are never expanded per entry.
 	nat = expandNATLists(nat, lists)
 	nat = dedupeNAT(nat)
 
@@ -72,89 +69,30 @@ func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.Fo
 		return all[i].ID < all[j].ID
 	})
 
-	iptOK := hasBin("iptables") || hasBin("iptables-save")
-	// In mock, plan both so dry-run shows full intent.
-	mock := !nftOK && !iptOK
-
-	// Does any rule actually target the iptables backend? ("auto" picks nft
-	// whenever nft exists, so on an nft host this is normally false.)
-	needIPT := false
-	for _, r := range all {
-		if !r.Enabled {
-			continue
-		}
-		be := strings.ToLower(r.Backend)
-		if be == "" || be == "auto" {
-			if nftOK || mock {
-				be = "nft"
-			} else {
-				be = "iptables"
-			}
-		}
-		if be == "iptables" {
-			needIPT = true
-			break
-		}
-	}
-
-	var cmds []string
-	// nft path: the entire managed table is replaced by one transaction, so
-	// there is nothing to ensure or flush separately. Emitted unconditionally
-	// when nft is usable — dropping the last rule must still leave an empty
-	// table rather than the previous generation's rules.
+	// nft is the only backend.
+	//
+	// The iptables path was dead code that still cost something: `auto`
+	// resolved to nft whenever the nft binary existed, which is every host in
+	// this fleet, so all seven NETPOLICYD_* chains sat empty while their seven
+	// jump rules were evaluated for every packet through INPUT, FORWARD,
+	// OUTPUT, PREROUTING and POSTROUTING — and flushIptablesChains() ran on
+	// every apply to clean chains nothing wrote to.
+	//
+	// Keeping two backends also meant two places to reason about, which is the
+	// same shape as the two-owners-of-the-forward-hook bug that caused the
+	// 2026-07-19 outage. One backend, one source of truth.
+	//
+	// Rules explicitly requesting Backend "iptables" are now emitted as nft:
+	// the alternative is dropping them silently, and a firewall rule that
+	// vanishes is worse than one expressed in the other syntax.
 	var nftRules []api.FirewallRule
-	if nftOK || mock {
-		for _, r := range all {
-			if !r.Enabled {
-				continue
-			}
-			be := strings.ToLower(r.Backend)
-			if be == "" || be == "auto" {
-				be = "nft"
-			}
-			if be == "nft" {
-				nftRules = append(nftRules, r)
-			}
-		}
-		if c := planNFTBatch(nftRules, lists); c != "" {
-			cmds = append(cmds, c)
-		}
-	}
-	switch {
-	case needIPT || mock:
-		// Rules to place: create chains + jumps, then they get flushed/refilled.
-		cmds = append(cmds, ensureIptablesBase()...)
-	case iptOK:
-		// No iptables-backed rules, but stale ones may be live from a previous
-		// generation. Flush them — without creating chains/jumps and without
-		// paying ~32 execs per apply on hosts that never used this backend.
-		cmds = append(cmds, flushIptablesChains()...)
-	}
-
-	// iptables-backed rules only — nft rules were emitted above as one batch.
-	seenCmd := map[string]bool{}
 	for _, r := range all {
-		if !r.Enabled {
-			continue
+		if r.Enabled {
+			nftRules = append(nftRules, r)
 		}
-		be := strings.ToLower(r.Backend)
-		if be == "" || be == "auto" {
-			if nftOK || mock {
-				be = "nft"
-			} else if iptOK {
-				be = "iptables"
-			} else {
-				be = "nft"
-			}
-		}
-		if be != "iptables" {
-			continue
-		}
-		c := iptablesCmd(r)
-		if c == "" || seenCmd[c] {
-			continue
-		}
-		seenCmd[c] = true
+	}
+	var cmds []string
+	if c := planNFTBatch(nftRules, lists); c != "" {
 		cmds = append(cmds, c)
 	}
 	return cmds
@@ -263,49 +201,23 @@ func flushNFTChains() []string {
 	return cmds
 }
 
-// flushIptablesChains clears managed iptables chains WITHOUT creating them.
+// natFamily returns the "ip"/"ip6" qualifier nft requires for snat/dnat inside
+// an inet table: bare `dnat to 10.0.0.1` is rejected with "specify `dnat ip' or
+// 'dnat ip6' in inet table to disambiguate".
 //
-// Guarded by one existence check in a single sh -c: a host with no managed
-// iptables chains pays one exec, not the ~32 that unconditionally running
-// ensureIptablesBase would cost on every apply (apply runs on every write).
-func flushIptablesChains() []string {
-	return []string{
-		`iptables -t filter -L NETPOLICYD_FWD -n >/dev/null 2>&1 && { ` +
-			`iptables -t filter -F NETPOLICYD_IN 2>/dev/null; ` +
-			`iptables -t filter -F NETPOLICYD_FWD 2>/dev/null; ` +
-			`iptables -t filter -F NETPOLICYD_OUT 2>/dev/null; ` +
-			`iptables -t nat -F NETPOLICYD_PRE 2>/dev/null; ` +
-			`iptables -t nat -F NETPOLICYD_POST 2>/dev/null; ` +
-			`iptables -t mangle -F NETPOLICYD_PRE 2>/dev/null; ` +
-			`iptables -t mangle -F NETPOLICYD_POST 2>/dev/null; ` +
-			`iptables -t mangle -F NETPOLICYD_FWD 2>/dev/null; } || true`,
+// This mattered more than it looks. The managed table is applied as one atomic
+// transaction, so a single malformed rule rejects the ENTIRE ruleset — het's
+// mesh port-forward DNAT rules silently blocked every other rule on that node
+// from updating, leaving a stale generation resident and healthy-looking.
+func natFamily(addr string) string {
+	host := addr
+	if i := strings.LastIndex(host, "]"); i > 0 {
+		return "ip6" // [2001:db8::1]:443
 	}
-}
-
-// ensureIptablesBase creates/flushes dedicated NETPOLICYD jump chains so
-// repeated apply does not pile rules into built-in chains.
-func ensureIptablesBase() []string {
-	return []string{
-		// filter — separate chains per hook so input rules never match forward traffic
-		`iptables -t filter -N NETPOLICYD_IN 2>/dev/null || iptables -t filter -F NETPOLICYD_IN`,
-		`iptables -t filter -N NETPOLICYD_FWD 2>/dev/null || iptables -t filter -F NETPOLICYD_FWD`,
-		`iptables -t filter -N NETPOLICYD_OUT 2>/dev/null || iptables -t filter -F NETPOLICYD_OUT`,
-		`iptables -t filter -C INPUT -j NETPOLICYD_IN 2>/dev/null || iptables -t filter -I INPUT 1 -j NETPOLICYD_IN`,
-		`iptables -t filter -C FORWARD -j NETPOLICYD_FWD 2>/dev/null || iptables -t filter -I FORWARD 1 -j NETPOLICYD_FWD`,
-		`iptables -t filter -C OUTPUT -j NETPOLICYD_OUT 2>/dev/null || iptables -t filter -I OUTPUT 1 -j NETPOLICYD_OUT`,
-		// nat
-		`iptables -t nat -N NETPOLICYD_PRE 2>/dev/null || iptables -t nat -F NETPOLICYD_PRE`,
-		`iptables -t nat -N NETPOLICYD_POST 2>/dev/null || iptables -t nat -F NETPOLICYD_POST`,
-		`iptables -t nat -C PREROUTING -j NETPOLICYD_PRE 2>/dev/null || iptables -t nat -I PREROUTING 1 -j NETPOLICYD_PRE`,
-		`iptables -t nat -C POSTROUTING -j NETPOLICYD_POST 2>/dev/null || iptables -t nat -I POSTROUTING 1 -j NETPOLICYD_POST`,
-		// mangle
-		`iptables -t mangle -N NETPOLICYD_PRE 2>/dev/null || iptables -t mangle -F NETPOLICYD_PRE`,
-		`iptables -t mangle -N NETPOLICYD_POST 2>/dev/null || iptables -t mangle -F NETPOLICYD_POST`,
-		`iptables -t mangle -N NETPOLICYD_FWD 2>/dev/null || iptables -t mangle -F NETPOLICYD_FWD`,
-		`iptables -t mangle -C PREROUTING -j NETPOLICYD_PRE 2>/dev/null || iptables -t mangle -I PREROUTING 1 -j NETPOLICYD_PRE`,
-		`iptables -t mangle -C POSTROUTING -j NETPOLICYD_POST 2>/dev/null || iptables -t mangle -I POSTROUTING 1 -j NETPOLICYD_POST`,
-		`iptables -t mangle -C FORWARD -j NETPOLICYD_FWD 2>/dev/null || iptables -t mangle -I FORWARD 1 -j NETPOLICYD_FWD`,
+	if strings.Count(host, ":") > 1 {
+		return "ip6"
 	}
+	return "ip"
 }
 
 func nftChainName(table, chain string) string {
@@ -400,12 +312,12 @@ func nftRuleBody(r api.FirewallRule) string {
 		if r.ToSource == "" {
 			return ""
 		}
-		parts = append(parts, "snat", "to", r.ToSource)
+		parts = append(parts, "snat", natFamily(r.ToSource), "to", r.ToSource)
 	case "dnat":
 		if r.ToDestination == "" {
 			return ""
 		}
-		parts = append(parts, "dnat", "to", r.ToDestination)
+		parts = append(parts, "dnat", natFamily(r.ToDestination), "to", r.ToDestination)
 	case "redirect":
 		if r.ToDestination != "" {
 			parts = append(parts, "redirect", "to", r.ToDestination)
@@ -437,106 +349,6 @@ func nftRuleBody(r api.FirewallRule) string {
 		parts = append(parts, "comment", nftComment(cmt))
 	}
 	return strings.Join(parts, " ")
-}
-
-func iptablesCmd(r api.FirewallRule) string {
-	table := strings.ToLower(r.Table)
-	if table == "" {
-		table = "filter"
-	}
-	// Use dedicated NETPOLICYD* chains (flushed each apply) instead of
-	// appending forever to built-in INPUT/FORWARD/POSTROUTING.
-	chain := iptablesManagedChain(table, r.Chain)
-	if chain == "" {
-		return ""
-	}
-
-	var args []string
-	args = append(args, "iptables", "-t", table, "-A", chain)
-	if r.Source != "" {
-		args = append(args, "-s", r.Source)
-	}
-	if r.Dest != "" {
-		args = append(args, "-d", r.Dest)
-	}
-	if r.InIface != "" {
-		args = append(args, "-i", r.InIface)
-	}
-	if r.OutIface != "" {
-		args = append(args, "-o", r.OutIface)
-	}
-	proto := strings.ToLower(r.Protocol)
-	if proto != "" && proto != "all" {
-		args = append(args, "-p", proto)
-	} else if r.Sport != "" || r.Dport != "" {
-		args = append(args, "-p", "tcp")
-		proto = "tcp"
-	}
-	if r.Sport != "" {
-		args = append(args, "--sport", r.Sport)
-	}
-	if r.Dport != "" {
-		args = append(args, "--dport", r.Dport)
-	}
-	if r.FwMark != 0 {
-		args = append(args, "-m", "mark", "--mark", fmt.Sprintf("0x%x", r.FwMark))
-	}
-	if cs := strings.TrimSpace(r.CtState); cs != "" {
-		// map "established,related" → ESTABLISHED,RELATED
-		up := strings.ToUpper(cs)
-		args = append(args, "-m", "conntrack", "--ctstate", up)
-	}
-
-	act := strings.ToLower(r.Action)
-	switch act {
-	case "accept", "drop", "return", "reject":
-		args = append(args, "-j", strings.ToUpper(act))
-	case "masquerade":
-		args = append(args, "-j", "MASQUERADE")
-	case "snat":
-		if r.ToSource == "" {
-			return ""
-		}
-		args = append(args, "-j", "SNAT", "--to-source", r.ToSource)
-	case "dnat":
-		if r.ToDestination == "" {
-			return ""
-		}
-		args = append(args, "-j", "DNAT", "--to-destination", r.ToDestination)
-	case "redirect":
-		args = append(args, "-j", "REDIRECT")
-		if r.ToDestination != "" {
-			// port only for redirect
-			args = append(args, "--to-ports", strings.TrimPrefix(r.ToDestination, ":"))
-		}
-	case "mark":
-		if r.SetMark == 0 {
-			return ""
-		}
-		args = append(args, "-j", "MARK", "--set-mark", fmt.Sprintf("0x%x", r.SetMark))
-	case "log":
-		args = append(args, "-j", "LOG")
-		pref := r.LogPrefix
-		if pref == "" {
-			pref = "netpolicyd"
-		}
-		// --log-prefix is Join'd into the sh -c line: one safe token, no spaces
-		args = append(args, "--log-prefix", sanitizeToken(pref))
-	default:
-		args = append(args, "-j", strings.ToUpper(act))
-	}
-	cmt := r.Comment
-	if cmt == "" {
-		cmt = r.Name
-	}
-	if cmt == "" {
-		cmt = r.ID
-	}
-	if cmt != "" {
-		// same sh -c sink as nft — whitelist, never a denylist
-		args = append(args, "-m", "comment", "--comment", "netpolicyd:"+sanitizeToken(cmt))
-	}
-	return strings.Join(args, " ")
 }
 
 // iptablesManagedChain maps logical chain → NETPOLICYD jump target.
