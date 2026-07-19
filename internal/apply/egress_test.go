@@ -259,3 +259,57 @@ func TestEgressSwitchDeletesOldRuleBySelectorAndPriority(t *testing.T) {
 		}
 	}
 }
+
+// Switching egress must flush conntrack for that client, or established flows
+// stay pinned to the old tunnel: their reply tuple still carries the old SNAT
+// address and the nft flowtable offloads them past the routing decision. The
+// user-visible symptom is "I changed my exit and nothing happened".
+//
+// Equally important: it must NOT flush when nothing changed, or every reconcile
+// would tear down every connection on the node.
+func TestConntrackFlushOnlyWhenEgressChanged(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	run := func(currentRule string) bool {
+		dir := t.TempDir()
+		log := filepath.Join(dir, "flushed.log")
+		ipStub := "#!/bin/sh\nif [ \"$1\" = \"-o\" ]; then\n"
+		if currentRule != "" {
+			ipStub += "  echo '" + currentRule + "'\n"
+		}
+		ipStub += "fi\nexit 0\n"
+		if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(ipStub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		ctStub := "#!/bin/sh\necho \"$@\" >> " + log + "\nexit 0\n"
+		if err := os.WriteFile(filepath.Join(dir, "conntrack"), []byte(ctStub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("sh", "-c",
+			conntrackFlushOnEgressChange("100.67.80.15/32", 10005, 114, "resid-zur"))
+		cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("command failed: %v\n%s", err, out)
+		}
+		b, _ := os.ReadFile(log)
+		return len(b) > 0
+	}
+
+	// Pointing at a different egress → must flush.
+	if !run("10005:\tfrom 100.67.80.15 lookup netpolicyd-resid-chi") {
+		t.Error("egress changed (resid-chi -> resid-zur) but conntrack was not flushed")
+	}
+	// Already correct, by name → must not flush.
+	if run("10005:\tfrom 100.67.80.15 lookup netpolicyd-resid-zur") {
+		t.Error("flushed conntrack when the egress had not changed (name form)")
+	}
+	// Already correct, by number (rt_tables has no name) → must not flush.
+	if run("10005:\tfrom 100.67.80.15 lookup 114") {
+		t.Error("flushed conntrack when the egress had not changed (numeric form)")
+	}
+	// No rule yet → nothing is pinned, must not flush.
+	if run("") {
+		t.Error("flushed conntrack on first install, dropping connections for no reason")
+	}
+}

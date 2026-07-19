@@ -210,6 +210,19 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 				// policy all agreed it had moved. Caught live: iPhone set to
 				// resid-zur, still egressing via resid-chi.
 				//
+				// Flush conntrack for this source when the egress actually changed.
+				//
+				// Rewriting the ip rule only steers NEW flows. Established ones stay
+				// pinned to the old tunnel by their conntrack entry (the reply tuple
+				// still carries the old SNAT address), and the nft flowtable offloads
+				// them past the routing decision entirely — so a user who switches
+				// exit sees no change until every existing connection dies on its
+				// own. For long-lived TLS that is effectively never, which reads as
+				// "I changed my egress and nothing happened".
+				//
+				// Only on change: an unconditional flush would tear down every
+				// connection on the node on every reconcile.
+				cmds = append(cmds, conntrackFlushOnEgressChange(src, prio, tid, p.EgressName))
 				// Looped because more than one stale duplicate may already exist.
 				cmds = append(cmds, fmt.Sprintf(
 					"while ip rule del from %s priority %d 2>/dev/null; do :; done; true", src, prio))
@@ -351,6 +364,27 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 	}
 
 	return cmds
+}
+
+// conntrackFlushOnEgressChange emits one command that clears conntrack for a
+// client source, but ONLY when its ip rule currently points somewhere other
+// than the table we are about to install.
+//
+// `ip rule show` prints the table by name when rt_tables has one and by number
+// otherwise, so both spellings count as "unchanged". An absent rule also counts
+// as unchanged — there is nothing pinned to a previous egress yet, and flushing
+// on first install would drop connections for no reason.
+func conntrackFlushOnEgressChange(src string, prio, tid int, egressName string) string {
+	host := strings.SplitN(src, "/", 2)[0]
+	return fmt.Sprintf(
+		`command -v conntrack >/dev/null 2>&1 && { `+
+			`npd_cur=$(ip -o rule show 2>/dev/null | `+
+			`sed -n 's|^%d:[[:space:]]*from %s\(/[0-9]\{1,\}\)\{0,1\} lookup \(.*\)$|\2|p' | head -1); `+
+			`case "$npd_cur" in `+
+			`""|%d|netpolicyd-%s) ;; `+
+			`*) conntrack -D -s %s >/dev/null 2>&1 || true ;; `+
+			`esac; }; true`,
+		prio, host, tid, egressName, host)
 }
 
 // rtTablesPath is where iproute2 keeps the table id -> name registry.
