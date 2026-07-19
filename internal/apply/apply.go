@@ -187,6 +187,7 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 	// keepIPRule records every managed rule this generation wants, so the prune
 	// below can delete the ones that belong to policies that have gone away.
 	keepIPRule := map[string]bool{}
+	var directSources []api.FirewallRule
 	for _, p := range s.Policies {
 		if !p.Enabled {
 			continue
@@ -245,8 +246,36 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 					Comment: "policy-deny:" + p.Name, Backend: "auto",
 				})
 			}
-		case api.ActionAllow, api.ActionDirect, api.ActionMasq, api.ActionForward:
-			// allow/direct: no special rule; masq/forward handled elsewhere
+		case api.ActionDirect:
+			// "Send these destinations out the main table instead of the
+			// device's egress tunnel."
+			//
+			// This used to be a no-op with a comment saying the firewall rule
+			// handled it. It did not: an nft `accept` is a permission verdict,
+			// and the routing decision was already made by the ip rule several
+			// steps earlier. So Iran-direct users had their Iran traffic
+			// accepted... down the tunnel, exactly like everything else. No
+			// destination-based ip rule existed on the node at all.
+			//
+			// nftables cannot route, so the split is: mark in mangle
+			// prerouting (which runs BEFORE the forward routing decision),
+			// then one fwmark ip rule pointing at main. A set lookup keeps it
+			// to one rule per source rather than one per destination prefix.
+			list := ""
+			if strings.EqualFold(p.Destination.Kind, "iplist") {
+				list = strings.TrimSpace(p.Destination.Value)
+			}
+			if src != "" && list != "" {
+				directSources = append(directSources, api.FirewallRule{
+					ID: "auto-direct-mark-" + p.ID, Enabled: true, Priority: p.Priority,
+					Table: "mangle", Chain: "prerouting",
+					Source: src, DestList: list,
+					Action: "mark", SetMark: directFwMark,
+					Comment: "direct-to-main:" + p.Name, Backend: "auto",
+				})
+			}
+		case api.ActionAllow, api.ActionMasq, api.ActionForward:
+			// allow: no special rule; masq/forward handled elsewhere
 		}
 	}
 
@@ -333,6 +362,20 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 			fwSeen[fp] = true
 			extraFW = append(extraFW, r)
 		}
+	}
+
+	// One fwmark rule serves every direct policy: they all mean the same thing,
+	// "use the main table". Priority is deliberately ABOVE the per-device egress
+	// rules (10005) — below them it would never be reached, because the egress
+	// rule matches on source alone and would win for every packet including the
+	// ones meant to go direct.
+	if len(directSources) > 0 && (hasBin("ip") || r.Backend == BackendMock) {
+		extraFW = append(extraFW, directSources...)
+		cmds = append(cmds, fmt.Sprintf(
+			"while ip rule del fwmark %#x priority %d 2>/dev/null; do :; done; true",
+			directFwMark, directRulePrio))
+		cmds = append(cmds, fmt.Sprintf(
+			"ip rule add fwmark %#x lookup main priority %d", directFwMark, directRulePrio))
 	}
 
 	// Prune managed ip rules whose policy is gone.
@@ -444,6 +487,15 @@ func ipRuleKey(from string, prio int) string {
 const (
 	managedIPRulePrioMin = 10000
 	managedIPRulePrioMax = 10999
+
+	// directFwMark tags packets an ActionDirect policy wants routed via main
+	// instead of the device's egress tunnel. One mark serves all such policies
+	// because they all mean the same thing.
+	directFwMark = 0x7a
+	// directRulePrio must sort ABOVE the per-device egress rules (10000+), or
+	// the egress rule — which matches on source alone — wins first and the
+	// marked packets never reach it.
+	directRulePrio = 9000
 )
 
 // pruneIPRules emits one command that deletes every `ip rule` in netpolicyd's

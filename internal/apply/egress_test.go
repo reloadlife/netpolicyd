@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -311,5 +312,78 @@ func TestConntrackFlushOnlyWhenEgressChanged(t *testing.T) {
 	// No rule yet → nothing is pinned, must not flush.
 	if run("") {
 		t.Error("flushed conntrack on first install, dropping connections for no reason")
+	}
+}
+
+// ActionDirect must produce ROUTING, not just a firewall verdict.
+//
+// It used to be a no-op: the control plane emitted an nft `accept` for the
+// destination list plus a policy that only documented intent. An accept is a
+// permission verdict and the routing decision was already made by the device's
+// egress ip rule, so Iran-direct traffic was accepted straight down the tunnel
+// and no destination-based ip rule existed on the node at all.
+func TestDirectPolicyMarksAndRoutesViaMain(t *testing.T) {
+	s := api.ApplyState{
+		Policies: []api.PolicyRule{
+			{
+				ID: "eg", Enabled: true, Priority: 5, Action: api.ActionEgress,
+				EgressName: "resid-zur", SourceCIDR: "100.67.80.15/32",
+			},
+			{
+				ID: "direct", Enabled: true, Priority: 10, Action: api.ActionDirect,
+				SourceCIDR:  "100.67.80.15/32",
+				Destination: api.Destination{Kind: "iplist", Value: "iran"},
+			},
+		},
+		IPLists: []api.IPList{{ID: "iplist-iran", Name: "iran", Entries: []string{"2.57.3.0/24"}}},
+	}
+	joined := strings.Join((&Runner{Backend: BackendMock, TableBase: 100}).Plan(s), "\n")
+
+	if !strings.Contains(joined, "meta mark set") {
+		t.Errorf("no mangle mark emitted:\n%s", joined)
+	}
+	// On an nft host the list compiles to a set reference; without nft it is
+	// expanded per entry for the iptables backend. Either way the mark must be
+	// constrained to the list's destinations and never match everything.
+	if !strings.Contains(joined, "@npd_list_iran") && !strings.Contains(joined, "ip daddr 2.57.3.0/24") {
+		t.Errorf("mark is not scoped to the destination list:\n%s", joined)
+	}
+	if !strings.Contains(joined, "mangle_prerouting") {
+		t.Errorf("mark must land in mangle prerouting, before the forward routing decision:\n%s", joined)
+	}
+	if !strings.Contains(joined, "lookup main") {
+		t.Errorf("no fwmark rule routing marked packets via main:\n%s", joined)
+	}
+	// The direct rule must sort ABOVE the per-device egress rule, or the egress
+	// rule — which matches on source alone — wins first and direct never applies.
+	di := strings.Index(joined, "ip rule add fwmark")
+	ei := strings.Index(joined, "ip rule add from 100.67.80.15/32 table")
+	if di < 0 || ei < 0 {
+		t.Fatalf("missing one of the rules:\n%s", joined)
+	}
+	getPrio := func(line string) int {
+		n, err := strconv.Atoi(line[strings.LastIndex(line, " ")+1:])
+		if err != nil {
+			t.Fatalf("cannot parse priority from %q: %v", line, err)
+		}
+		return n
+	}
+	dp := getPrio(strings.SplitN(joined[di:], "\n", 2)[0])
+	ep := getPrio(strings.SplitN(joined[ei:], "\n", 2)[0])
+	if dp >= ep {
+		t.Errorf("direct rule priority %d must be numerically below egress %d to be evaluated first", dp, ep)
+	}
+}
+
+// No destination list means nothing to route on — must not emit a bare fwmark
+// rule that would send the source's entire traffic out main.
+func TestDirectPolicyWithoutListEmitsNothing(t *testing.T) {
+	s := api.ApplyState{Policies: []api.PolicyRule{{
+		ID: "direct", Enabled: true, Priority: 10, Action: api.ActionDirect,
+		SourceCIDR: "100.67.80.15/32", Destination: api.Destination{Kind: "any"},
+	}}}
+	joined := strings.Join((&Runner{Backend: BackendMock, TableBase: 100}).Plan(s), "\n")
+	if strings.Contains(joined, "lookup main") || strings.Contains(joined, "meta mark set") {
+		t.Errorf("emitted direct routing with no destination list:\n%s", joined)
 	}
 }
