@@ -131,20 +131,15 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 		cmds = append(cmds, planIPRules(s.IPRules)...)
 	}
 
-	// Policy rules → ip rule + optional mark
+	// Policy rules → ip rule + optional mark.
+	// keepIPRule records every managed rule this generation wants, so the prune
+	// below can delete the ones that belong to policies that have gone away.
+	keepIPRule := map[string]bool{}
 	for _, p := range s.Policies {
 		if !p.Enabled {
 			continue
 		}
-		src := p.SourceCIDR
-		if src == "" {
-			for _, sub := range p.Subjects {
-				if sub.Kind == "cidr" && sub.Value != "" {
-					src = sub.Value
-					break
-				}
-			}
-		}
+		src := policySourceCIDR(p)
 		switch p.Action {
 		case api.ActionEgress:
 			tid := tableOf[p.EgressName]
@@ -152,10 +147,12 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 				continue
 			}
 			if src != "" {
+				prio := 10000 + p.Priority
 				cmds = append(cmds, fmt.Sprintf(
 					"ip rule del from %s table %d 2>/dev/null || true", src, tid))
 				cmds = append(cmds, fmt.Sprintf(
-					"ip rule add from %s table %d priority %d", src, tid, 10000+p.Priority))
+					"ip rule add from %s table %d priority %d", src, tid, prio))
+				keepIPRule[ipRuleKey(src, prio)] = true
 			}
 			if p.Mark != 0 {
 				cmds = append(cmds, fmt.Sprintf(
@@ -191,15 +188,7 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 		if !p.Enabled || p.Action != api.ActionEgress || p.EgressName == "" {
 			continue
 		}
-		src := p.SourceCIDR
-		if src == "" {
-			for _, sub := range p.Subjects {
-				if sub.Kind == "cidr" {
-					src = sub.Value
-					break
-				}
-			}
-		}
+		src := policySourceCIDR(p)
 		if src == "" {
 			src = "0.0.0.0/0"
 		}
@@ -219,8 +208,69 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 		})
 	}
 
+	// Auto forward-accept for egress policies.
+	//
+	// The route alone does not get the packet out: it still has to survive the
+	// forward hook. Deriving the accept from the same policy set means an egress
+	// becomes usable the moment it is declared, instead of when someone
+	// remembers to re-run a script holding a hardcoded interface list.
+	//
+	// This is the 2026-07-19 outage: a device switched from one egress to
+	// another, the ip rule and route were written correctly, and every packet
+	// was dropped at forward because the new egress was not on that list.
+	//
+	// Emitted as ordinary FirewallRules so they ride the same plan (and the same
+	// flush-then-add) as everything else in the managed chains.
+	extraFW := append([]api.FirewallRule{}, s.Firewall...)
+	fwSeen := map[string]bool{}
+	for _, r := range s.Firewall {
+		if r.Enabled {
+			fwSeen[firewallFingerprint(r)] = true
+		}
+	}
+	for _, p := range s.Policies {
+		if !p.Enabled || p.Action != api.ActionEgress || p.EgressName == "" {
+			continue
+		}
+		src := normalizeCIDR(policySourceCIDR(p))
+		if src == "" {
+			continue
+		}
+		for _, r := range []api.FirewallRule{{
+			ID: "auto-fwd-" + p.ID, Enabled: true, Priority: 90,
+			Table: "filter", Chain: "forward",
+			Source: src, OutIface: p.EgressName, Action: "accept",
+			Comment: "egress-forward:" + p.Name, Backend: "auto",
+		}, {
+			// Return path. Conntrack normally covers this, but not across a
+			// conntrack flush, a NAT rebuild, or an offloaded flow re-entering
+			// the slow path — and a half-open return path is very hard to debug.
+			ID: "auto-fwd-ret-" + p.ID, Enabled: true, Priority: 90,
+			Table: "filter", Chain: "forward",
+			Dest: src, InIface: p.EgressName, Action: "accept",
+			Comment: "egress-return:" + p.Name, Backend: "auto",
+		}} {
+			fp := firewallFingerprint(r)
+			if fwSeen[fp] {
+				continue
+			}
+			fwSeen[fp] = true
+			extraFW = append(extraFW, r)
+		}
+	}
+
+	// Prune managed ip rules whose policy is gone.
+	//
+	// Without this the applier is additive-only: it writes rules for what is in
+	// desired and never removes rules for what left. A deleted device kept its
+	// `ip rule` forever, so re-issuing that VIP to a new device silently handed
+	// the new device the old one's egress.
+	if hasBin("ip") || r.Backend == BackendMock {
+		cmds = append(cmds, pruneIPRules(keepIPRule))
+	}
+
 	// Unified firewall (nft + iptables) including NAT + Forwards (+ IP list expand)
-	cmds = append(cmds, planFirewall(s.Firewall, extraNAT, s.Forwards, s.IPLists)...)
+	cmds = append(cmds, planFirewall(extraFW, extraNAT, s.Forwards, s.IPLists)...)
 
 	// Traffic control
 	if hasBin("tc") || r.Backend == BackendMock {
@@ -228,6 +278,62 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 	}
 
 	return cmds
+}
+
+// policySourceCIDR is the client source a policy applies to: the explicit
+// SourceCIDR override, else the first cidr subject. Empty when neither is set.
+func policySourceCIDR(p api.PolicyRule) string {
+	if p.SourceCIDR != "" {
+		return p.SourceCIDR
+	}
+	for _, sub := range p.Subjects {
+		if sub.Kind == "cidr" && sub.Value != "" {
+			return sub.Value
+		}
+	}
+	return ""
+}
+
+// ipRuleKey identifies a managed `ip rule` by the selectors we can read back
+// from `ip rule show`.
+func ipRuleKey(from string, prio int) string {
+	return fmt.Sprintf("%s@%d", normalizeCIDR(from), prio)
+}
+
+// managedIPRulePrioMin/Max bound the priority band netpolicyd owns. Egress
+// policies land at 10000+Priority, so anything else in this band is ours and
+// stale. Rules outside the band (the kernel's 0/32766/32767, or an operator's
+// hand-written rule at a different priority) are never touched.
+const (
+	managedIPRulePrioMin = 10000
+	managedIPRulePrioMax = 10999
+)
+
+// pruneIPRules emits one command that deletes every `ip rule` in netpolicyd's
+// priority band that this generation did not ask for.
+//
+// One exec, not one per stale rule: the live rule set is only knowable on the
+// host, so the comparison happens there against a keep-list we build here.
+func pruneIPRules(keep map[string]bool) string {
+	want := make([]string, 0, len(keep))
+	for k := range keep {
+		want = append(want, k)
+	}
+	sort.Strings(want) // stable output so dry-run plans are diffable
+	return fmt.Sprintf(
+		`npd_keep=%s; ip -o rule show 2>/dev/null | `+
+			`sed -n 's/^\([0-9]\{1,\}\):[[:space:]]*from \([^ ]\{1,\}\) .*$/\1 \2/p' | `+
+			`while read -r npd_prio npd_from; do `+
+			`[ "$npd_prio" -ge %d ] && [ "$npd_prio" -le %d ] || continue; `+
+			`case " $npd_keep " in *" $npd_from@$npd_prio "*) continue;; esac; `+
+			`ip rule del from "$npd_from" priority "$npd_prio" 2>/dev/null || true; `+
+			`done`,
+		shellQuote(strings.Join(want, " ")), managedIPRulePrioMin, managedIPRulePrioMax)
+}
+
+// shellQuote single-quotes a value for safe interpolation into sh -c.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // Apply runs the plan. Returns result with commands and errors.

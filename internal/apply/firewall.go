@@ -16,7 +16,13 @@ import (
 // Idempotent: managed nft chains are flushed before rules are re-added so
 // repeated apply does not accumulate duplicates.
 func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.ForwardSpec, lists []api.IPList) []string {
-	rules = expandFirewallLists(rules, lists)
+	// On an nft host, list references compile to set references — do NOT expand
+	// them into a rule per entry. Expansion is only for the iptables backend,
+	// which has no equivalent of a named set.
+	nftOK := hasBin("nft")
+	if !nftOK {
+		rules = expandFirewallLists(rules, lists)
+	}
 	nat = expandNATLists(nat, lists)
 	nat = dedupeNAT(nat)
 
@@ -66,7 +72,6 @@ func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.Fo
 		return all[i].ID < all[j].ID
 	})
 
-	nftOK := hasBin("nft")
 	iptOK := hasBin("iptables") || hasBin("iptables-save")
 	// In mock, plan both so dry-run shows full intent.
 	mock := !nftOK && !iptOK
@@ -93,12 +98,27 @@ func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.Fo
 	}
 
 	var cmds []string
-	// Always ensure+flush managed chains whenever the backend is usable, even
-	// when no rule currently targets it — deleting the last nft/iptables rule
-	// must still flush the managed chains so stale rules disappear from the host.
+	// nft path: the entire managed table is replaced by one transaction, so
+	// there is nothing to ensure or flush separately. Emitted unconditionally
+	// when nft is usable — dropping the last rule must still leave an empty
+	// table rather than the previous generation's rules.
+	var nftRules []api.FirewallRule
 	if nftOK || mock {
-		cmds = append(cmds, ensureNFTBase()...)
-		cmds = append(cmds, flushNFTChains()...)
+		for _, r := range all {
+			if !r.Enabled {
+				continue
+			}
+			be := strings.ToLower(r.Backend)
+			if be == "" || be == "auto" {
+				be = "nft"
+			}
+			if be == "nft" {
+				nftRules = append(nftRules, r)
+			}
+		}
+		if c := planNFTBatch(nftRules, lists); c != "" {
+			cmds = append(cmds, c)
+		}
 	}
 	switch {
 	case needIPT || mock:
@@ -111,7 +131,7 @@ func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.Fo
 		cmds = append(cmds, flushIptablesChains()...)
 	}
 
-	// Track emitted command lines to avoid identical adds in one plan.
+	// iptables-backed rules only — nft rules were emitted above as one batch.
 	seenCmd := map[string]bool{}
 	for _, r := range all {
 		if !r.Enabled {
@@ -127,13 +147,10 @@ func planFirewall(rules []api.FirewallRule, nat []api.NATSpec, forwards []api.Fo
 				be = "nft"
 			}
 		}
-		var c string
-		switch be {
-		case "iptables":
-			c = iptablesCmd(r)
-		default:
-			c = nftRuleCmd(r)
+		if be != "iptables" {
+			continue
 		}
+		c := iptablesCmd(r)
 		if c == "" || seenCmd[c] {
 			continue
 		}
@@ -319,9 +336,18 @@ func nftChainName(table, chain string) string {
 }
 
 func nftRuleCmd(r api.FirewallRule) string {
-	chain := nftChainName(r.Table, r.Chain)
+	body := nftRuleBody(r)
+	if body == "" {
+		return ""
+	}
+	return "nft add rule inet netpolicyd " + nftChainName(r.Table, r.Chain) + " " + body
+}
+
+// nftRuleBody is the match+action half of a rule, without the
+// `nft add rule inet netpolicyd <chain>` prefix, so the same compiler serves
+// both the one-command-per-rule path and the batched `nft -f` script.
+func nftRuleBody(r api.FirewallRule) string {
 	var parts []string
-	parts = append(parts, "nft", "add", "rule", "inet", "netpolicyd", chain)
 
 	if r.InIface != "" {
 		parts = append(parts, "iifname", strconv.Quote(r.InIface))

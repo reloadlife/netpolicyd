@@ -14,8 +14,11 @@ func TestPlanFirewallNFT(t *testing.T) {
 		Action: "accept", Name: "ssh",
 	}}, nil, nil, nil)
 	joined := strings.Join(cmds, "\n")
-	if !strings.Contains(joined, "nft add table inet netpolicyd") && !strings.Contains(joined, "list table inet netpolicyd") {
-		t.Fatalf("missing nft base:\n%s", joined)
+	// The managed table is replaced wholesale in one transaction, so the base
+	// is the table definition inside the batch rather than a separate command.
+	if !strings.Contains(joined, "delete table inet netpolicyd") ||
+		!strings.Contains(joined, "table inet netpolicyd {") {
+		t.Fatalf("missing nft table replace:\n%s", joined)
 	}
 	if !strings.Contains(joined, "tcp dport 22 accept") {
 		t.Fatalf("missing accept rule:\n%s", joined)
@@ -99,20 +102,31 @@ func TestApplyStatePlan(t *testing.T) {
 	}
 }
 
-func TestPlanFirewallFlushesBeforeAdd(t *testing.T) {
+// Rules must not accumulate across applies. The mechanism is an atomic table
+// replace (declare empty, delete, redefine) in a single `nft -f` transaction,
+// which supersedes the old per-chain flush.
+func TestPlanFirewallReplacesTableAtomically(t *testing.T) {
 	cmds := planFirewall([]api.FirewallRule{{
 		ID: "fw1", Enabled: true, Backend: "nft",
 		Table: "nat", Chain: "postrouting", Source: "10.77.0.4/32",
 		OutIface: "gre-lab", Action: "masquerade",
 	}}, nil, nil, nil)
 	joined := strings.Join(cmds, "\n")
-	if !strings.Contains(joined, "nft flush chain inet netpolicyd postrouting") {
-		t.Fatalf("expected flush before add:\n%s", joined)
-	}
-	fi := strings.Index(joined, "flush chain inet netpolicyd postrouting")
+	di := strings.Index(joined, "delete table inet netpolicyd")
 	ai := strings.Index(joined, "masquerade")
-	if fi < 0 || ai < 0 || fi > ai {
-		t.Fatalf("flush should precede add: flush=%d add=%d", fi, ai)
+	if di < 0 || ai < 0 || di > ai {
+		t.Fatalf("delete must precede the rules it replaces: delete=%d add=%d\n%s", di, ai, joined)
+	}
+	// One transaction, not one exec per rule — that per-rule loop was a
+	// measured fork storm on thr-respina (1054 forks/10s).
+	nftCmds := 0
+	for _, c := range cmds {
+		if strings.HasPrefix(c, "nft ") {
+			nftCmds++
+		}
+	}
+	if nftCmds != 1 {
+		t.Fatalf("expected exactly 1 nft command, got %d:\n%s", nftCmds, joined)
 	}
 }
 
