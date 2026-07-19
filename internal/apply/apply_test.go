@@ -37,12 +37,12 @@ func TestAutoMasqSkippedWhenExplicitNATExists(t *testing.T) {
 
 func TestDeviceRequiredByCmd(t *testing.T) {
 	cases := map[string]string{
-		`ip route replace default dev gre-lab table 100`: "gre-lab",
-		`tc qdisc replace dev gre-lab root handle 1: htb default 1`: "gre-lab",
+		`ip route replace default dev gre-lab table 100`:                                                            "gre-lab",
+		`tc qdisc replace dev gre-lab root handle 1: htb default 1`:                                                 "gre-lab",
 		`tc filter replace dev wg0 protocol ip parent 1: prio 1 handle 1: u32 match ip src 10.8.0.1/32 flowid 1:10`: "wg0",
-		`sysctl -w net.ipv4.ip_forward=1`: "",
-		`mkdir -p /etc/iproute2`: "",
-		`ip link set gre-lab up`: "gre-lab",
+		`sysctl -w net.ipv4.ip_forward=1`:                                                                           "",
+		`mkdir -p /etc/iproute2`:                                                                                    "",
+		`ip link set gre-lab up`:                                                                                    "gre-lab",
 	}
 	for cmd, want := range cases {
 		got := deviceRequiredByCmd(cmd)
@@ -87,7 +87,7 @@ func TestRepeatedPlanSingleMasqFingerprint(t *testing.T) {
 	if countMasq(a) != 1 || countMasq(b) != 1 {
 		t.Fatalf("a=%d b=%d", countMasq(a), countMasq(b))
 	}
-	if !strings.Contains(strings.Join(a, "\n"), "flush chain inet netpolicyd postrouting") {
-		t.Fatal("missing flush")
+	if !strings.Contains(strings.Join(a, "\n"), "delete table inet netpolicyd") {
+		t.Fatal("missing atomic table replace")
 	}
 }

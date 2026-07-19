@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/reloadlife/netpolicyd/internal/apply"
@@ -112,22 +113,26 @@ func TestIPListAndNATExpandApply(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
 		t.Fatal(err)
 	}
-	// should plan flush + masq for both entries, no runaway duplicates
+	// Both list entries must get a masquerade rule, with no runaway duplicates.
+	// nft rules now ship inside one batched `nft -f` transaction, so count rule
+	// LINES across the plan rather than commands.
 	masq := 0
-	flush := false
+	replace := false
 	for _, c := range res.Commands {
-		if containsAll(c, "masquerade", "10.77.0.") {
-			masq++
+		for _, ln := range strings.Split(c, "\n") {
+			if containsAll(ln, "masquerade", "10.77.0.") {
+				masq++
+			}
 		}
-		if containsAll(c, "flush chain", "postrouting") {
-			flush = true
+		if containsAll(c, "delete table", "netpolicyd") {
+			replace = true
 		}
 	}
 	if masq != 2 {
-		t.Fatalf("want 2 masq cmds, got %d\n%v", masq, res.Commands)
+		t.Fatalf("want 2 masq rules, got %d\n%v", masq, res.Commands)
 	}
-	if !flush {
-		t.Fatal("expected nft flush in plan")
+	if !replace {
+		t.Fatal("expected atomic nft table replace in plan")
 	}
 }
 
