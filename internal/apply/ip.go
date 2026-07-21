@@ -34,6 +34,16 @@ func planIPAddrs(addrs []api.IPAddrSpec) []string {
 	return cmds
 }
 
+// ipRulePrio is the priority a spec lands on. Shared with the prune keep-list
+// in apply.go: if the two ever disagree the prune deletes the rule it just
+// added, which is how the fail-closed egress guard went missing.
+func ipRulePrio(r api.IPRuleSpec, i int) int {
+	if r.Priority > 0 {
+		return r.Priority
+	}
+	return 11000 + i
+}
+
 // planIPRules emits `ip rule add` for explicit policy routing.
 func planIPRules(rules []api.IPRuleSpec) []string {
 	var cmds []string
@@ -41,10 +51,7 @@ func planIPRules(rules []api.IPRuleSpec) []string {
 		if !r.Enabled {
 			continue
 		}
-		prio := r.Priority
-		if prio <= 0 {
-			prio = 11000 + i
-		}
+		prio := ipRulePrio(r, i)
 		// Best-effort delete then add for idempotency on same selectors.
 		del := buildIPRule("del", r, prio)
 		add := buildIPRule("add", r, prio)

@@ -71,3 +71,39 @@ func TestNormalizeCIDR(t *testing.T) {
 		t.Fatal(normalizeCIDR("fd00::1"))
 	}
 }
+
+// An explicit IPRuleSpec inside the managed priority band must survive the
+// prune. keepIPRule was built only from Policies, so the plan added the
+// fail-closed egress guard (control plane emits it at priority 10500) and then
+// deleted it again in the same run — the guard has never existed on a live
+// node. That matters because an `ip rule` pointing at an EMPTY table does not
+// fail: the lookup falls through to main, i.e. the node's own WAN. Observed on
+// sky-ams-1, where table 883 holds no routes and the guard was absent.
+func TestExplicitIPRuleSurvivesPrune(t *testing.T) {
+	r := &Runner{Backend: BackendMock, TableBase: 100}
+	cmds := r.Plan(api.ApplyState{
+		IPRules: []api.IPRuleSpec{
+			{Enabled: true, Priority: 10500, From: "10.98.1.2/32", Action: "blackhole"},
+		},
+		Policies: []api.PolicyRule{
+			{Enabled: true, Action: api.ActionEgress, EgressName: "resid-zur",
+				SourceCIDR: "10.98.1.3/32", Priority: 5},
+		},
+	})
+	joined := strings.Join(cmds, "\n")
+	if !strings.Contains(joined, "blackhole") {
+		t.Fatal("guard was never planned")
+	}
+	prune := ""
+	for _, c := range cmds {
+		if strings.Contains(c, "npd_keep=") {
+			prune = c
+		}
+	}
+	if prune == "" {
+		t.Fatal("no prune command planned")
+	}
+	if !strings.Contains(prune, "10.98.1.2/32@10500") {
+		t.Errorf("prune keep-list omits the explicit guard, so it is deleted right after being added:\n%s", prune)
+	}
+}

@@ -178,15 +178,29 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 		cmds = append(cmds, strings.Join(parts, " "))
 	}
 
-	// Explicit IP rules
-	if hasBin("ip") || r.Backend == BackendMock {
-		cmds = append(cmds, planIPRules(s.IPRules)...)
-	}
-
-	// Policy rules → ip rule + optional mark.
 	// keepIPRule records every managed rule this generation wants, so the prune
 	// below can delete the ones that belong to policies that have gone away.
 	keepIPRule := map[string]bool{}
+
+	// Explicit IP rules
+	if hasBin("ip") || r.Backend == BackendMock {
+		cmds = append(cmds, planIPRules(s.IPRules)...)
+		// Explicit rules are wanted too. They used to be added here and then
+		// deleted by the prune below in the same run, because only policies fed
+		// the keep-list. That silently removed the control plane's fail-closed
+		// egress guard (priority 10500, inside the managed band) on every
+		// reconcile — and an ip rule pointing at an empty table does not fail,
+		// it falls through to main, so a client whose exit was down egressed out
+		// the node's own WAN instead.
+		for i, ir := range s.IPRules {
+			if !ir.Enabled || ir.From == "" {
+				continue
+			}
+			keepIPRule[ipRuleKey(ir.From, ipRulePrio(ir, i))] = true
+		}
+	}
+
+	// Policy rules → ip rule + optional mark.
 	var directSources []api.FirewallRule
 	for _, p := range s.Policies {
 		if !p.Enabled {
