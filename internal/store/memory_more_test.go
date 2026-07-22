@@ -129,3 +129,31 @@ func TestDeleteIPListByName(t *testing.T) {
 		t.Fatal("still there")
 	}
 }
+
+// A desired-state push must replace the TC set, not merge into it.
+//
+// Every family except Policies was upsert-only, so netpolicyd accumulated
+// every spec it had ever been sent and kept re-applying the dead ones. Live on
+// sky-ams-1 that meant four TC specs where the control plane sent one: two for
+// sessions that had ended and one naming an interface that does not exist, all
+// failing on every reconcile and burying the real error.
+func TestReplaceTCDropsStaleSpecs(t *testing.T) {
+	m := New()
+	if _, err := m.UpsertTC(api.TCSpec{
+		ID: "tc-old", Device: "oc-oc-sky-in0", RateTxBps: 1000,
+		MatchKind: "src_cidr", MatchValue: "10.98.1.41/32",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.ReplaceTC([]api.TCSpec{{
+		ID: "tc-new", Device: "oc-oc-sky-in0", RateTxBps: 2000,
+		MatchKind: "src_cidr", MatchValue: "10.98.1.3/32",
+	}})
+	got := m.ListTC()
+	if len(got) != 1 {
+		t.Fatalf("got %d specs, want 1 — the stale spec survived the push", len(got))
+	}
+	if got[0].ID != "tc-new" {
+		t.Errorf("kept %q, want tc-new", got[0].ID)
+	}
+}

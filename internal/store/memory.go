@@ -337,6 +337,29 @@ func (m *Memory) ListTC() []api.TCSpec {
 	return out
 }
 
+// ReplaceTC swaps the whole TC set, mirroring ReplacePolicies.
+//
+// Upserting alone let stale specs accumulate forever: netpolicyd kept
+// re-applying shapers for sessions that had ended and for interfaces that no
+// longer existed, so every reconcile reported errors that were not actionable
+// and hid the real ones.
+func (m *Memory) ReplaceTC(specs []api.TCSpec) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tc = make(map[string]*api.TCSpec, len(specs))
+	for i := range specs {
+		t := specs[i]
+		if t.ID == "" {
+			t.ID = "tc-" + uuid.NewString()[:8]
+		}
+		if t.MatchKind == "" {
+			t.MatchKind = "any"
+		}
+		cp := t
+		m.tc[cp.ID] = &cp
+	}
+}
+
 func (m *Memory) UpsertTC(t api.TCSpec) (api.TCSpec, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

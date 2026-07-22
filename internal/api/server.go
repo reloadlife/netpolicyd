@@ -449,10 +449,12 @@ func (s *Server) desired(w http.ResponseWriter, r *http.Request) {
 			errs = append(errs, err.Error())
 		}
 	}
-	for _, t := range d.TC {
-		if _, err := s.Store.UpsertTC(t); err != nil {
-			errs = append(errs, err.Error())
-		}
+	// Replace, not merge — same as Policies above. Upserting let dead specs
+	// accumulate: shapers for ended sessions and for interfaces that no longer
+	// exist kept being re-applied every reconcile, erroring forever and hiding
+	// the real failures. nil means "not sent", which must not wipe the set.
+	if d.TC != nil {
+		s.Store.ReplaceTC(d.TC)
 	}
 	for _, f := range d.Firewall {
 		if _, err := s.Store.UpsertFirewall(f); err != nil {
