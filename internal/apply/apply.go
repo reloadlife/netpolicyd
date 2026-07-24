@@ -275,11 +275,19 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 			// prerouting (which runs BEFORE the forward routing decision),
 			// then one fwmark ip rule pointing at main. A set lookup keeps it
 			// to one rule per source rather than one per destination prefix.
+			destKind := strings.ToLower(strings.TrimSpace(p.Destination.Kind))
 			list := ""
-			if strings.EqualFold(p.Destination.Kind, "iplist") {
+			if destKind == "iplist" {
 				list = strings.TrimSpace(p.Destination.Value)
 			}
-			if src != "" && list != "" {
+			if src != "" && (destKind == "any" || destKind == "") {
+				prio := 10000 + p.Priority
+				cmds = append(cmds, fmt.Sprintf(
+					"while ip rule del from %s priority %d 2>/dev/null; do :; done; true", src, prio))
+				cmds = append(cmds, fmt.Sprintf(
+					"ip rule add from %s lookup main priority %d", src, prio))
+				keepIPRule[ipRuleKey(src, prio)] = true
+			} else if src != "" && list != "" {
 				directSources = append(directSources, api.FirewallRule{
 					ID: "auto-direct-mark-" + p.ID, Enabled: true, Priority: p.Priority,
 					Table: "mangle", Chain: "prerouting",
@@ -304,7 +312,10 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 		covered[natCoverKey(n.SourceCIDR, n.SourceList, n.OutIface)] = true
 	}
 	for _, p := range s.Policies {
-		if !p.Enabled || p.Action != api.ActionEgress || p.EgressName == "" {
+		if !p.Enabled || p.EgressName == "" {
+			continue
+		}
+		if p.Action != api.ActionEgress && p.Action != api.ActionDirect {
 			continue
 		}
 		src := policySourceCIDR(p)
@@ -348,7 +359,10 @@ func (r *Runner) Plan(s api.ApplyState) []string {
 		}
 	}
 	for _, p := range s.Policies {
-		if !p.Enabled || p.Action != api.ActionEgress || p.EgressName == "" {
+		if !p.Enabled || p.EgressName == "" {
+			continue
+		}
+		if p.Action != api.ActionEgress && p.Action != api.ActionDirect {
 			continue
 		}
 		src := normalizeCIDR(policySourceCIDR(p))

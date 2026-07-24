@@ -448,6 +448,34 @@ func (m *Memory) UpsertFirewall(r api.FirewallRule) (api.FirewallRule, error) {
 	return cp, nil
 }
 
+func (m *Memory) ReplaceFirewall(rules []api.FirewallRule) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.firewall = make(map[string]*api.FirewallRule, len(rules))
+	for i := range rules {
+		r := rules[i]
+		if r.Table == "" {
+			r.Table = "filter"
+		}
+		if r.Chain == "" || r.Action == "" {
+			continue
+		}
+		switch strings.ToLower(r.Table) {
+		case "filter", "nat", "mangle", "raw":
+		default:
+			continue
+		}
+		if r.Backend == "" {
+			r.Backend = "auto"
+		}
+		if r.ID == "" {
+			r.ID = "fw-" + uuid.NewString()[:8]
+		}
+		cp := r
+		m.firewall[cp.ID] = &cp
+	}
+}
+
 func (m *Memory) DeleteFirewall(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -538,6 +566,26 @@ func (m *Memory) UpsertIPRule(r api.IPRuleSpec) (api.IPRuleSpec, error) {
 	cp := r
 	m.ipRules[cp.ID] = &cp
 	return cp, nil
+}
+
+func (m *Memory) ReplaceIPRules(rules []api.IPRuleSpec) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ipRules = make(map[string]*api.IPRuleSpec, len(rules))
+	for i := range rules {
+		r := rules[i]
+		if r.Table == "" && (r.Action == "" || r.Action == "lookup") {
+			continue
+		}
+		if r.Action == "" {
+			r.Action = "lookup"
+		}
+		if r.ID == "" {
+			r.ID = "rule-" + uuid.NewString()[:8]
+		}
+		cp := r
+		m.ipRules[cp.ID] = &cp
+	}
 }
 
 func (m *Memory) DeleteIPRule(id string) error {

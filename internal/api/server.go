@@ -456,20 +456,16 @@ func (s *Server) desired(w http.ResponseWriter, r *http.Request) {
 	if d.TC != nil {
 		s.Store.ReplaceTC(d.TC)
 	}
-	for _, f := range d.Firewall {
-		if _, err := s.Store.UpsertFirewall(f); err != nil {
-			errs = append(errs, err.Error())
-		}
+	if d.Firewall != nil {
+		s.Store.ReplaceFirewall(d.Firewall)
 	}
 	for _, a := range d.IPAddrs {
 		if _, err := s.Store.UpsertIPAddr(a); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
-	for _, r := range d.IPRules {
-		if _, err := s.Store.UpsertIPRule(r); err != nil {
-			errs = append(errs, err.Error())
-		}
+	if d.IPRules != nil {
+		s.Store.ReplaceIPRules(d.IPRules)
 	}
 	for _, l := range d.Links {
 		if _, err := s.Store.UpsertLink(l); err != nil {

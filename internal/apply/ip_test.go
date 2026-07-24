@@ -107,3 +107,34 @@ func TestExplicitIPRuleSurvivesPrune(t *testing.T) {
 		t.Errorf("prune keep-list omits the explicit guard, so it is deleted right after being added:\n%s", prune)
 	}
 }
+
+func TestDirectPolicyAnyDestSteersViaMain(t *testing.T) {
+	r := &Runner{Backend: BackendMock, TableBase: 100}
+	cmds := r.Plan(api.ApplyState{
+		Policies: []api.PolicyRule{{
+			ID: "wan-1", Enabled: true, Action: api.ActionDirect,
+			EgressName: "eth0", SourceCIDR: "10.98.1.9/32", Priority: 5,
+			Destination: api.Destination{Kind: "any"},
+			Name:        "device-egress:phone→wan",
+		}},
+	})
+	joined := strings.Join(cmds, "\n")
+	if !strings.Contains(joined, "ip rule add from 10.98.1.9/32 lookup main priority 10005") {
+		t.Fatalf("WAN Kind=any must install lookup main:\n%s", joined)
+	}
+	prune := ""
+	for _, c := range cmds {
+		if strings.Contains(c, "npd_keep=") {
+			prune = c
+		}
+	}
+	if prune == "" || !strings.Contains(prune, "10.98.1.9/32@10005") {
+		t.Fatalf("WAN direct rule must enter prune keep-list:\n%s", joined)
+	}
+	if !strings.Contains(joined, "masquerade") || !strings.Contains(joined, "eth0") {
+		t.Fatalf("WAN EgressName must drive auto-MASQ on eth0:\n%s", joined)
+	}
+	if !strings.Contains(joined, "10.98.1.9/32") || !strings.Contains(joined, "accept") {
+		t.Fatalf("WAN EgressName must drive forward-accept:\n%s", joined)
+	}
+}

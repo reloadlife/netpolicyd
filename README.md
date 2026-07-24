@@ -57,6 +57,15 @@ curl -s -H "Authorization: Bearer dev-token" -H 'Content-Type: application/json'
 
 Roughly plans `ip rule` / table default via `gre-lab`, optional masquerade, and related firewall.
 
+## WAN exit (`action=direct`, destination `any`)
+
+Node uplink selection (control-plane WAN egress) must use `action=direct` with
+`destination.kind=any` **and** `egress_name` set to the uplink (e.g. `eth0`).
+That installs `from SRC lookup main` at priority `10000+P`, keeps the prune
+list non-empty (so stale blackholes die), and auto-emits MASQ + forward-accept
+out the uplink. Clearing `egress_name` or treating `direct`+`any` as a no-op
+is a known outage class (2026-07-24).
+
 ## netpolicyctl
 
 | Mode | Start |

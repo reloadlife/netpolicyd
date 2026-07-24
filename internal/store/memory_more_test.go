@@ -157,3 +157,26 @@ func TestReplaceTCDropsStaleSpecs(t *testing.T) {
 		t.Errorf("kept %q, want tc-new", got[0].ID)
 	}
 }
+
+func TestForcePruneWhenAssertedEmpty(t *testing.T) {
+	m := New()
+	if _, err := m.UpsertIPRule(api.IPRuleSpec{
+		ID: "stale-bh", Enabled: true, Priority: 10500,
+		From: "10.98.1.9/32", Action: "blackhole",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.ReplaceIPRules([]api.IPRuleSpec{})
+	if n := len(m.ListIPRules()); n != 0 {
+		t.Fatalf("ReplaceIPRules([]) left %d rules — stale blackhole would be re-applied", n)
+	}
+	if _, err := m.UpsertFirewall(api.FirewallRule{
+		ID: "stale-fw", Table: "filter", Chain: "forward", Action: "drop", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.ReplaceFirewall([]api.FirewallRule{})
+	if n := len(m.ListFirewall()); n != 0 {
+		t.Fatalf("ReplaceFirewall([]) left %d rules", n)
+	}
+}

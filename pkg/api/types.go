@@ -27,10 +27,8 @@ type Subject struct {
 type Destination struct {
 	// Kind: any | cidr | resource | host | dns | iplist
 	//
-	// "iplist" names an IPList by id or name and is how a policy expresses
-	// "these destinations", which a single cidr cannot. Required for
-	// ActionDirect to be routable: without it the policy can say "send this
-	// source out the main table" but not for which destinations.
+	// "iplist" names an IPList by id or name (Iran-direct partial steer via
+	// fwmark). "any" / "" means full-main for the source (WAN exits).
 	Kind  string `json:"kind"`
 	Value string `json:"value"` // e.g. 0.0.0.0/0, res-id, 10.0.0.5, iran
 }
